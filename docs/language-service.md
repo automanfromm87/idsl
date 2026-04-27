@@ -332,6 +332,27 @@ Three caches keep this responsive:
 The folder-scan cache is the one that matters most: without it, every
 `workspace/symbol` keypress would re-walk the entire tree.
 
+## Known architectural debt
+
+- **Lexer / CST state is process-global.** `lib/syntax/cst.ml`'s
+  `pending_leading` / `buf` and `lib/lexer.mll`'s `paren_depth` /
+  `at_eof` / `last_token` are module-level refs, reset before each
+  parse via `Lexer.reset` / `Cst.reset`. Today the LSP server is
+  single-threaded so this is safe; it blocks future work on
+  background indexing, parallel pre-compilation, request
+  cancellation, or worker-style compilation. The right fix is to
+  thread a per-parse state record through the lexer and CST
+  builders — ocamllex supports it via `rule … state = parse …`.
+
+- **Outgoing wire conversion to UTF-16 is partial.** The four highest-
+  traffic paths (`location_of_pos`, `range_of_pos`,
+  `text_edit_to_json`, `diagnostic_json`) route through
+  `Utf16.utf16_of_byte_col` against the per-result file's source.
+  A handful of less-trafficked sites still use the byte-column shims
+  (`lsp_pos_json`, `range_json`); these are noted in the source and
+  only matter when emitting positions for files containing codepoints
+  outside the BMP / multibyte UTF-8.
+
 ## What's *not* here
 
 - **Incremental reparse.** Today every `didChange` does a full

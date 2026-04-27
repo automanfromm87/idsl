@@ -69,25 +69,59 @@ let ok_response id = result id JNull
 
 (* ---------- LSP value helpers ---------- *)
 
+(* Internal `lsp_pos.character` is a *byte* column — that's what the
+   parser/CST work in.  At the LSP wire we must hand the client a
+   UTF-16 column.  `wire_pos_of_doc_pos` does the conversion using the
+   source text of the position's host file; `wire_pos_of_pos_fname`
+   resolves the host via `pos_fname` so cross-file results don't
+   silently fall through to byte columns. *)
+let source_for_uri uri =
+  match Workspace.get_doc ws ~uri with
+  | Some d -> d.content
+  | None   ->
+      match Workspace.read_file_opt (Workspace.path_of_uri uri) with
+      | Some s -> s
+      | None   -> ""
+
+let utf16_pos_to_json ~src (p : Lsp_query.lsp_pos) : Json.t =
+  (* `p.line` is already 0-indexed; `p.character` is a byte column. *)
+  let line = p.line in
+  let utf16_col =
+    if src = "" then p.character
+    else
+      let l = Utf16.line_of_source src line in
+      Utf16.utf16_of_byte_col l p.character
+  in
+  JObj [ "line", JNum (float_of_int line);
+         "character", JNum (float_of_int utf16_col) ]
+
+let utf16_range ~src (s : Lsp_query.lsp_pos) (e : Lsp_query.lsp_pos) : Json.t =
+  JObj [ "start", utf16_pos_to_json ~src s;
+         "end",   utf16_pos_to_json ~src e ]
+
+(* Backwards-compat shims: byte-column wire writers used by the few
+   handlers that have no convenient way to grab a per-URI source.
+   These are only correct for ASCII-only docs and should be removed
+   once every call site routes through `utf16_pos_to_json`. *)
 let lsp_pos_json (p : Lsp_query.lsp_pos) : Json.t =
-  JObj [ "line", JNum (float_of_int p.line);
-         "character", JNum (float_of_int p.character) ]
+  utf16_pos_to_json ~src:"" p
 
 let range_json (s : Lsp_query.lsp_pos) (e : Lsp_query.lsp_pos) : Json.t =
-  JObj [ "start", lsp_pos_json s; "end", lsp_pos_json e ]
+  utf16_range ~src:"" s e
 
-let diagnostic_json (d : Lsp_query.diagnostic) : Json.t =
+let diagnostic_json ~src (d : Lsp_query.diagnostic) : Json.t =
   JObj [
-    "range",    range_json d.d_pos d.d_end;
-    "severity", JNum 1.0;        (* 1 = Error *)
+    "range",    utf16_range ~src d.d_pos d.d_end;
+    "severity", JNum 1.0;
     "source",   JStr ("idsl-" ^ d.d_stage);
     "message",  JStr d.d_message;
   ]
 
 let publish_diagnostics oc uri diags =
+  let src = source_for_uri uri in
   write_message oc (notif "textDocument/publishDiagnostics" (JObj [
     "uri",         JStr uri;
-    "diagnostics", JArr (List.map diagnostic_json diags);
+    "diagnostics", JArr (List.map (diagnostic_json ~src) diags);
   ]))
 
 (* ---------- workspace shims ---------- *)
@@ -127,10 +161,15 @@ let json_field obj k =
 let json_str = function Json.JStr s -> s | _ -> ""
 let json_num = function Json.JNum n -> int_of_float n | _ -> 0
 
-let lsp_pos_of_json j : Lsp_query.lsp_pos =
+(* UTF-16 → byte at the wire boundary.  The client sends a UTF-16
+   `character` column; OCaml's parser indexes by byte.  Translation
+   needs the doc's source text — this helper looks it up by URI. *)
+let lsp_pos_of_json_for_uri ~uri j : Lsp_query.lsp_pos =
   let line = match json_field j "line"      with Some n -> json_num n | None -> 0 in
-  let char = match json_field j "character" with Some n -> json_num n | None -> 0 in
-  { line; character = char }
+  let utf16_col = match json_field j "character" with
+    | Some n -> json_num n | None -> 0 in
+  let src = source_for_uri uri in
+  { line; character = Utf16.byte_col_of_utf16 ~src ~line utf16_col }
 
 let handle_initialize id params =
   (* Capture workspaceFolders the client sent at startup. *)
@@ -293,15 +332,27 @@ let handle_did_change oc params =
   let updated = List.fold_left (fun src change ->
     match json_field change "range" with
     | None ->
-        (* full sync — fallback: use the entire text *)
         (match json_field change "text" with
          | Some (JStr s) -> s
          | _ -> src)
     | Some range ->
-        let start_p = match json_field range "start" with
-          | Some j -> lsp_pos_of_json j | None -> { Lsp_query.line = 0; character = 0 } in
-        let end_p = match json_field range "end" with
-          | Some j -> lsp_pos_of_json j | None -> start_p in
+        (* Range positions arrive as UTF-16 columns; convert to byte
+           columns *against the pre-edit `src`* before slicing.  Doing
+           this inside the fold means each iteration uses the correct
+           snapshot to interpret subsequent edits. *)
+        let parse_pos field =
+          match json_field range field with
+          | Some j ->
+              let line = match json_field j "line"
+                with Some n -> json_num n | None -> 0 in
+              let utf16_col = match json_field j "character"
+                with Some n -> json_num n | None -> 0 in
+              { Lsp_query.line;
+                character = Utf16.byte_col_of_utf16 ~src ~line utf16_col }
+          | None -> { Lsp_query.line = 0; character = 0 }
+        in
+        let start_p = parse_pos "start" in
+        let end_p   = parse_pos "end" in
         let new_text = match json_field change "text" with
           | Some (JStr s) -> s | _ -> "" in
         apply_range_edit src
@@ -331,7 +382,12 @@ let kind_of_comp = function
   | Lsp_query.CompKeyword  -> 14   (* Keyword *)
   | Lsp_query.CompSnippet  -> 27   (* Snippet *)
 
-let comp_to_json (c : Lsp_query.completion) =
+(* Each completion item gets `data = {"uri": <originating-doc>,
+   "id": <key>}` so that `completionItem/resolve` can fetch the right
+   typed program — picking any open doc would risk pulling
+   documentation from an unrelated session that happens to share a
+   bare name (e.g. two `schema Item` in different domains). *)
+let comp_to_json ~uri (c : Lsp_query.completion) =
   let base = [
     "label",            Json.JStr c.c_label;
     "kind",             Json.JNum (float_of_int (kind_of_comp c.c_kind));
@@ -343,31 +399,35 @@ let comp_to_json (c : Lsp_query.completion) =
     | Some s -> base @ [ "detail", Json.JStr s ]
     | None   -> base in
   let base = match c.c_data_id with
-    | Some d -> base @ [ "data", Json.JStr d ]
-    | None   -> base in
+    | Some d ->
+        let data = Json.JObj [ "uri", Json.JStr uri; "id", Json.JStr d ] in
+        base @ [ "data", data ]
+    | None -> base in
   Json.JObj base
 
 let handle_completion_resolve id params =
-  let uri_of_data _params = "" in
-  ignore (uri_of_data params);
-  (* The client returns a CompletionItem; we look up `data` and fill in
-     `documentation`. Without `data` there's nothing to enrich. *)
-  let data_id = match json_field params "data" with
-    | Some (JStr s) -> Some s | _ -> None in
-  match data_id with
-  | None -> result id params
-  | Some data ->
-    (* We need a typed program to enrich; pick any open doc that compiles. *)
-    let tp_opt =
-      List.find_map (fun (_uri, (s : Session.t)) -> s.typed)
-        (Workspace.compile_all ws) in
-    (match tp_opt with
+  (* `data` is the JSON object we tucked into the original completion
+     item.  Both fields must be present for resolve to be deterministic
+     — the URI binds the lookup to the session we offered the item
+     from, the id is the kind-tagged key that `Lsp_query.resolve_completion`
+     understands. *)
+  let data = json_field params "data" in
+  let uri = match data with
+    | Some d -> (match json_field d "uri" with Some (JStr u) -> u | _ -> "")
+    | None -> "" in
+  let data_id = match data with
+    | Some d -> (match json_field d "id"  with Some (JStr s) -> Some s | _ -> None)
+    | None -> None in
+  match data_id, uri with
+  | None, _ | _, "" -> result id params
+  | Some key, _ ->
+    let s = Workspace.compile_doc ws ~uri in
+    (match s.typed with
      | None -> result id params
      | Some tp ->
-       match Lsp_query.resolve_completion tp data with
+       match Lsp_query.resolve_completion tp key with
        | None -> result id params
        | Some md ->
-         (* Merge docstring into the original item. *)
          let doc = Json.JObj [ "kind", Json.JStr "markdown";
                                "value", Json.JStr md ] in
          let extended = match params with
@@ -380,7 +440,7 @@ let handle_completion id params =
     | Some td -> (match json_field td "uri" with Some j -> json_str j | _ -> "")
     | _ -> "" in
   let pos = match json_field params "position" with
-    | Some j -> lsp_pos_of_json j
+    | Some j -> lsp_pos_of_json_for_uri ~uri j
     | None   -> { Lsp_query.line = 0; character = 0 } in
   let empty () = result id (JObj [ "isIncomplete", JBool false; "items", JArr [] ]) in
   match get_src uri with
@@ -392,7 +452,7 @@ let handle_completion id params =
       let items = Lsp_query.completions_at cst prog tp pos in
       result id (JObj [
         "isIncomplete", JBool false;
-        "items", JArr (List.map comp_to_json items);
+        "items", JArr (List.map (comp_to_json ~uri) items);
       ])
 
 (* The semantic index now lives on the Session and is computed lazily
@@ -401,17 +461,28 @@ let handle_completion id params =
    handle. *)
 let index_for uri _src = Session.index (Workspace.compile_doc ws ~uri)
 
+(* `length` is given in bytes (it's a `String.length name` produced by
+   the indexer, which is byte-counting).  Convert both endpoints to
+   UTF-16 against the source file the position belongs to.  When
+   `pos_fname` is empty we fall back to byte cols, which is the legacy
+   ASCII-only behavior. *)
 let range_of_pos (p : Lexing.position) ~length =
   let lp = Lsp_query.pos_lsp_of_lex p in
   let end_p = { lp with character = lp.character + length } in
-  range_json lp end_p
+  let src =
+    if p.pos_fname = "" then ""
+    else
+      let uri = Workspace.uri_of_pos_fname ~fallback:"" p.pos_fname in
+      source_for_uri uri
+  in
+  utf16_range ~src lp end_p
 
 let handle_definition id params =
   let uri = match json_field params "textDocument" with
     | Some td -> (match json_field td "uri" with Some j -> json_str j | _ -> "")
     | _ -> "" in
   let pos = match json_field params "position" with
-    | Some j -> lsp_pos_of_json j
+    | Some j -> lsp_pos_of_json_for_uri ~uri j
     | None   -> { Lsp_query.line = 0; character = 0 } in
   match get_src uri with
   | None -> result id JNull
@@ -433,7 +504,7 @@ let handle_references id params =
     | Some td -> (match json_field td "uri" with Some j -> json_str j | _ -> "")
     | _ -> "" in
   let pos = match json_field params "position" with
-    | Some j -> lsp_pos_of_json j
+    | Some j -> lsp_pos_of_json_for_uri ~uri j
     | None   -> { Lsp_query.line = 0; character = 0 } in
   let include_decl =
     match json_field params "context" with
@@ -470,7 +541,7 @@ let handle_hover id params =
     | Some td -> (match json_field td "uri" with Some j -> json_str j | _ -> "")
     | _ -> "" in
   let pos = match json_field params "position" with
-    | Some j -> lsp_pos_of_json j
+    | Some j -> lsp_pos_of_json_for_uri ~uri j
     | None   -> { line = 0; character = 0 } in
   match get_src uri with
   | None -> result id JNull
@@ -581,7 +652,7 @@ let handle_document_highlight id params =
     | Some td -> (match json_field td "uri" with Some j -> json_str j | _ -> "")
     | _ -> "" in
   let pos = match json_field params "position" with
-    | Some j -> lsp_pos_of_json j
+    | Some j -> lsp_pos_of_json_for_uri ~uri j
     | None   -> { Lsp_query.line = 0; character = 0 } in
   match get_src uri with
   | None -> result id (JArr [])
@@ -624,7 +695,7 @@ let handle_selection_range id params =
     | Some td -> (match json_field td "uri" with Some j -> json_str j | _ -> "")
     | _ -> "" in
   let positions = match json_field params "positions" with
-    | Some (JArr xs) -> List.map lsp_pos_of_json xs
+    | Some (JArr xs) -> List.map (lsp_pos_of_json_for_uri ~uri) xs
     | _ -> [] in
   match get_src uri with
   | None -> result id (JArr [])
@@ -671,7 +742,7 @@ let handle_signature_help id params =
     | Some td -> (match json_field td "uri" with Some j -> json_str j | _ -> "")
     | _ -> "" in
   let pos = match json_field params "position" with
-    | Some j -> lsp_pos_of_json j
+    | Some j -> lsp_pos_of_json_for_uri ~uri j
     | None   -> { Lsp_query.line = 0; character = 0 } in
   match get_src uri with
   | None -> result id JNull
@@ -696,10 +767,10 @@ let handle_inlay_hint id params =
     match json_field params "range" with
     | Some r ->
         let s = match json_field r "start" with
-          | Some j -> lsp_pos_of_json j
+          | Some j -> lsp_pos_of_json_for_uri ~uri j
           | None   -> { Lsp_query.line = 0; character = 0 } in
         let e = match json_field r "end" with
-          | Some j -> lsp_pos_of_json j
+          | Some j -> lsp_pos_of_json_for_uri ~uri j
           | None   -> { Lsp_query.line = max_int / 2; character = 0 } in
         s.line, e.line
     | None -> 0, max_int / 2
@@ -776,9 +847,18 @@ let workspace_edit_changes (pairs : (string * Json.t) list) : Json.t =
     (u, Json.JArr (List.rev xs)) :: acc) by_uri [] in
   Json.JObj [ "changes", Json.JObj changes ]
 
+(* Each edit's range is in *byte* columns (the indexer counts bytes
+   when computing decl/ref lengths).  Convert to UTF-16 against the
+   target file's source so `Range.character` is wire-correct. *)
 let text_edit_to_json (e : Lsp_query.text_edit) : Json.t =
+  let src =
+    if e.te_pos_fname = "" then ""
+    else
+      let uri = Workspace.uri_of_pos_fname ~fallback:"" e.te_pos_fname in
+      source_for_uri uri
+  in
   JObj [
-    "range",   sym_range_to_json e.te_range;
+    "range",   utf16_range ~src e.te_range.sr_start e.te_range.sr_end;
     "newText", JStr e.te_new_text;
   ]
 
@@ -787,7 +867,7 @@ let handle_prepare_rename id params =
     | Some td -> (match json_field td "uri" with Some j -> json_str j | _ -> "")
     | _ -> "" in
   let pos = match json_field params "position" with
-    | Some j -> lsp_pos_of_json j
+    | Some j -> lsp_pos_of_json_for_uri ~uri j
     | None   -> { Lsp_query.line = 0; character = 0 } in
   match get_src uri with
   | None -> result id JNull
@@ -810,7 +890,7 @@ let handle_rename id params =
     | Some td -> (match json_field td "uri" with Some j -> json_str j | _ -> "")
     | _ -> "" in
   let pos = match json_field params "position" with
-    | Some j -> lsp_pos_of_json j
+    | Some j -> lsp_pos_of_json_for_uri ~uri j
     | None   -> { Lsp_query.line = 0; character = 0 } in
   let new_name = match json_field params "newName" with
     | Some (JStr s) -> s | _ -> "" in
@@ -855,7 +935,7 @@ let handle_code_action id params =
         match json_field d "range" with
         | Some r ->
             let s = match json_field r "start" with
-              | Some j -> lsp_pos_of_json j
+              | Some j -> lsp_pos_of_json_for_uri ~uri j
               | None   -> { Lsp_query.line = 0; character = 0 } in
             s.line, s.character
         | None -> 0, 0
@@ -941,10 +1021,10 @@ let handle_range_formatting id params =
     match json_field params "range" with
     | Some r ->
         let s = match json_field r "start" with
-          | Some j -> lsp_pos_of_json j
+          | Some j -> lsp_pos_of_json_for_uri ~uri j
           | None   -> { Lsp_query.line = 0; character = 0 } in
         let e = match json_field r "end" with
-          | Some j -> lsp_pos_of_json j
+          | Some j -> lsp_pos_of_json_for_uri ~uri j
           | None   -> s in
         s.line, e.line
     | None -> 0, 0
@@ -965,7 +1045,7 @@ let handle_on_type_formatting id params =
     | Some td -> (match json_field td "uri" with Some j -> json_str j | _ -> "")
     | _ -> "" in
   let pos = match json_field params "position" with
-    | Some j -> lsp_pos_of_json j
+    | Some j -> lsp_pos_of_json_for_uri ~uri j
     | None   -> { Lsp_query.line = 0; character = 0 } in
   let ch = match json_field params "ch" with
     | Some (JStr s) -> s | _ -> "" in
@@ -984,12 +1064,11 @@ let handle_on_type_formatting id params =
 let location_of_pos ~fallback (p : Lexing.position) ~length : Json.t =
   let lp = Lsp_query.pos_lsp_of_lex p in
   let end_p = { lp with character = lp.character + length } in
+  let target_uri = Workspace.uri_of_pos_fname ~fallback p.pos_fname in
+  let src = source_for_uri target_uri in
   Json.JObj [
-    "uri",   Json.JStr (Workspace.uri_of_pos_fname ~fallback p.pos_fname);
-    "range", Json.JObj [
-      "start", lsp_pos_to_json lp;
-      "end",   lsp_pos_to_json end_p;
-    ];
+    "uri",   Json.JStr target_uri;
+    "range", utf16_range ~src lp end_p;
   ]
 
 (* Standard "textDocument + position → optional (uri, pos, idx)" pull.
@@ -1000,7 +1079,7 @@ let with_text_doc_pos params : (string * Lsp_query.lsp_pos * Semantic_index.t) o
     | Some td -> (match json_field td "uri" with Some j -> json_str j | _ -> "")
     | _ -> "" in
   let pos = match json_field params "position" with
-    | Some j -> lsp_pos_of_json j
+    | Some j -> lsp_pos_of_json_for_uri ~uri j
     | None   -> { Lsp_query.line = 0; character = 0 } in
   match get_src uri with
   | None -> None
@@ -1022,7 +1101,7 @@ let handle_type_definition id params =
     | Some td -> (match json_field td "uri" with Some j -> json_str j | _ -> "")
     | _ -> "" in
   let pos = match json_field params "position" with
-    | Some j -> lsp_pos_of_json j
+    | Some j -> lsp_pos_of_json_for_uri ~uri j
     | None   -> { Lsp_query.line = 0; character = 0 } in
   match get_src uri with
   | None -> result id JNull
@@ -1058,7 +1137,7 @@ let handle_prepare_call_hierarchy id params =
     | Some td -> (match json_field td "uri" with Some j -> json_str j | _ -> "")
     | _ -> "" in
   let pos = match json_field params "position" with
-    | Some j -> lsp_pos_of_json j
+    | Some j -> lsp_pos_of_json_for_uri ~uri j
     | None   -> { Lsp_query.line = 0; character = 0 } in
   match get_src uri with
   | None -> result id (JArr [])
@@ -1143,7 +1222,7 @@ let handle_prepare_type_hierarchy id params =
     | Some td -> (match json_field td "uri" with Some j -> json_str j | _ -> "")
     | _ -> "" in
   let pos = match json_field params "position" with
-    | Some j -> lsp_pos_of_json j
+    | Some j -> lsp_pos_of_json_for_uri ~uri j
     | None   -> { Lsp_query.line = 0; character = 0 } in
   match get_src uri with
   | None -> result id (JArr [])
@@ -1202,8 +1281,9 @@ let handle_pull_diagnostics id params =
     ])
   | Some _ ->
     let s = Workspace.compile_doc ws ~uri in
+    let src = source_for_uri uri in
     let regular =
-      List.map (fun d -> diagnostic_json (Lsp_query.lsp_of_diag d))
+      List.map (fun d -> diagnostic_json ~src (Lsp_query.lsp_of_diag d))
         s.diagnostics in
     let unused = match Session.index s with
       | Some idx -> List.map unused_diag_json (Lsp_query.unused_diagnostics idx)
@@ -1374,7 +1454,32 @@ let () =
           | Some j -> j | _ -> JNull in
         (match method_ with
          | "initialize"  -> write_message oc (handle_initialize id params)
-         | "initialized" -> ()
+         | "initialized" ->
+             (* Server → client: dynamically register interest in
+                file-system events for *.idsl. Without this, the
+                workspace cache only learns about disk changes when
+                the editor *happens* to be configured to forward them
+                — which most clients don't do without an explicit
+                registration request. *)
+             let req = Json.JObj [
+               "jsonrpc", Json.JStr "2.0";
+               "id",      Json.JStr "watcher-registration";
+               "method",  Json.JStr "client/registerCapability";
+               "params",  Json.JObj [
+                 "registrations", Json.JArr [
+                   Json.JObj [
+                     "id",     Json.JStr "idsl-file-watcher";
+                     "method", Json.JStr "workspace/didChangeWatchedFiles";
+                     "registerOptions", Json.JObj [
+                       "watchers", Json.JArr [
+                         Json.JObj [ "globPattern", Json.JStr "**/*.idsl" ];
+                       ];
+                     ];
+                   ];
+                 ];
+               ];
+             ] in
+             write_message oc req
          | "textDocument/didOpen"   -> handle_did_open oc params
          | "textDocument/didChange" -> handle_did_change oc params
          | "textDocument/didSave"   -> ()

@@ -236,6 +236,46 @@ let prop_references_count_consistent =
 
 (* ---------- driver ---------- *)
 
+(* ---------- Utf16 round-trip ---------------------------------- *)
+
+(* For any line + any byte column, converting byte → utf16 → byte
+   should land on a byte that's <= original (rounds to nearest char
+   boundary).  And going utf16 → byte → utf16 from a column past every
+   codepoint is exact. *)
+let arb_utf8_line =
+  let snippets = Q.Gen.oneofl [
+    "abc"; "x"; "ascii"; "汉";        (* CJK 3-byte *)
+    "🎉";                              (* 4-byte, surrogate pair *)
+    "café";                            (* 2-byte é *)
+    "a汉b🎉c";                          (* mixed *)
+    "";
+  ] in
+  Q.make ~print:(fun s -> Printf.sprintf "%S" s)
+    Q.Gen.(list_size (int_bound 4) snippets >|= String.concat "")
+
+let prop_utf16_round_trip =
+  Q.Test.make ~name:"byte→utf16→byte fixed point at end"
+    ~count:200 arb_utf8_line
+    (fun line ->
+      let n = String.length line in
+      let u = Utf16.utf16_of_byte_col line n in
+      let b = Utf16.byte_of_utf16_col line u in
+      b = n)
+
+let prop_utf16_monotone =
+  Q.Test.make ~name:"utf16 column is monotonic in byte column"
+    ~count:200 arb_utf8_line
+    (fun line ->
+      let n = String.length line in
+      let prev = ref (-1) in
+      let ok = ref true in
+      for i = 0 to n do
+        let u = Utf16.utf16_of_byte_col line i in
+        if u < !prev then ok := false;
+        prev := u
+      done;
+      !ok)
+
 let () =
   Printf.printf "\n--- property regressions ---\n";
   let cases = [
@@ -246,6 +286,8 @@ let () =
     "generated programs typecheck",                prop_generator_well_typed;
     "rename produces ≥ 1 edit at the decl",        prop_rename_finds_renamed;
     "references count matches index entries",      prop_references_count_consistent;
+    "Utf16 byte→u16→byte fixed point",             prop_utf16_round_trip;
+    "Utf16 column is monotonic",                   prop_utf16_monotone;
   ] in
   List.iter (fun (name, t) -> run_test ~name t) cases;
   Printf.printf "%d passed, %d failed\n" !pass !fail;
