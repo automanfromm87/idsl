@@ -64,7 +64,17 @@ type field =
   | FRaw     of pos * ident * example
   | FDerived of pos * ident * expr
 
-type schema_def = { sname : ident; spos : pos; sfields : field list }
+(* `domain : ident option` on every decl: None = top-level (global),
+   Some d = declared inside a `domain d:` block. The pipeline uses this
+   to scope name lookups — same-domain references resolve first, then
+   global. *)
+
+type schema_def = {
+  sname   : ident;
+  spos    : pos;
+  sfields : field list;
+  sdomain : ident option;
+}
 
 type rule_def = {
   rpath        : ident list;
@@ -76,6 +86,7 @@ type rule_def = {
   rpriority    : int;                 (* default 0; higher fires first *)
   rwhen        : (pos * expr) list;
   rthen        : (pos * expr) list;
+  rdomain      : ident option;
 }
 
 type metadata = { mkey : string; mvalue : string }
@@ -98,10 +109,11 @@ type expectation =
   | MustNot of pos * expr
 
 type test_def = {
-  tname   : string;
-  tpos    : pos;
-  tgiven  : given_block;
-  texpect : expectation list;
+  tname    : string;
+  tpos     : pos;
+  tgiven   : given_block;
+  texpect  : expectation list;
+  tdomain  : ident option;
 }
 
 type action_param = { pname : ident; ptype : ty_annot; ppos : pos }
@@ -112,9 +124,10 @@ and ty_annot =
   | AnnSchema of string                 (* user-defined schema name *)
 
 type action_sig = {
-  asname   : ident;
-  asparams : action_param list;
-  aspos    : pos;
+  asname    : ident;
+  asparams  : action_param list;
+  aspos     : pos;
+  asdomain  : ident option;
 }
 
 type instance_def = {
@@ -124,6 +137,7 @@ type instance_def = {
   ischema_pos  : pos;
   ipos         : pos;
   ivalues      : field_assign list;
+  idomain      : ident option;
 }
 
 type include_decl = { inc_path : string; inc_pos : pos }

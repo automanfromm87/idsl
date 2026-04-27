@@ -177,6 +177,33 @@ Supported in expressions:
 Comments: `# to end of line`. Multi-line expressions: wrap in `()`, or
 break after a binary operator (parser auto-continues).
 
+### Domains (namespacing)
+
+`domain X:` blocks scope every declaration inside, so the same bare
+name can be reused in unrelated areas of the same file (or workspace):
+
+```
+domain shipping:
+  schema Item:
+    - SKU: e.g. "X"
+
+  schema Order:
+    - Items: e.g. [Item]              # same-domain ref, bare name OK
+
+domain billing:
+  schema Item:                        # not a duplicate of shipping.Item
+    - Price: e.g. $20
+
+  schema Invoice:
+    - Lines: e.g. [Item]              # billing.Item, not shipping.Item
+```
+
+Inside a `domain D:` block, an unqualified reference `X` resolves to
+`D.X` first and falls back to the global (top-level) `X`. Cross-domain
+references are not yet supported in Phase 1 — `domain billing:` cannot
+see `shipping.Item`. Actions and metadata declared at the top level
+remain visible to every domain.
+
 ---
 
 ## Multi-file projects

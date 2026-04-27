@@ -18,7 +18,7 @@ let is_keyword = function
   | "of" | "in" | "where" | "is" | "missing" | "present"
   | "true" | "false" | "min" | "max" | "for"
   | "test" | "given" | "expect" | "action" | "instance"
-  | "on" | "priority" | "include" -> true
+  | "on" | "priority" | "include" | "domain" -> true
   | _ -> false
 
 (* tokens after which a newline is treated as continuation *)
@@ -30,6 +30,7 @@ let is_continuation = function
   | EG _ | IE _ | LBRACKET _ | COLON _ | LBRACE _ | EQ _
   | TEST _ | GIVEN _ | EXPECT _
   | ACTION _ | PIPE _ | INSTANCE _ | ON _ | PRIORITY _ | INCLUDE _
+  | DOMAIN _
     -> true
   | _ -> false
 
@@ -121,6 +122,7 @@ rule token = parse
           | "on"       -> (fun ct -> ON ct)
           | "priority" -> (fun ct -> PRIORITY ct)
           | "include"  -> (fun ct -> INCLUDE ct)
+          | "domain"   -> (fun ct -> DOMAIN ct)
           | _ -> assert false
         in
         emit_log lexbuf (KW id) parser_tok_ctor

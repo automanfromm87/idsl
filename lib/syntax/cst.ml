@@ -88,6 +88,7 @@ type node_kind =
   | NTest
   | NInstance
   | NInclude
+  | NDomain
   | NField
   | NFieldBody
   | NExample
@@ -118,6 +119,7 @@ let pp_node_kind = function
   | NTest         -> "Test"
   | NInstance     -> "Instance"
   | NInclude      -> "Include"
+  | NDomain       -> "Domain"
   | NField        -> "Field"
   | NFieldBody    -> "FieldBody"
   | NExample      -> "Example"

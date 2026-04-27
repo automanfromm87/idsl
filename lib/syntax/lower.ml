@@ -251,7 +251,7 @@ let lower_schema (n : node) : schema_def =
       | _ -> None) kids in
   (* spos points at the schema name (not the `schema` keyword) so that
      hover / goto / rename / refs all anchor on the identifier. *)
-  { sname = name; spos = name_pos; sfields = fields }
+  { sname = name; spos = name_pos; sfields = fields; sdomain = None }
 
 (* ---------- include / metadata / action_sig / instance ---------- *)
 
@@ -293,7 +293,8 @@ let lower_action_sig (n : node) : action_sig =
       let params = List.filter_map (function
         | GNode p when p.nkind = NActionParam -> Some (lower_action_param p)
         | _ -> None) rest in
-      { asname = tok_text name; asparams = params; aspos = name.start }
+      { asname = tok_text name; asparams = params; aspos = name.start;
+        asdomain = None }
   | _ -> err "action_sig shape"
 
 (* Reuse field / given_assign / etc. for instance bodies. *)
@@ -317,7 +318,8 @@ let lower_instance (n : node) : instance_def =
         ischema      = tok_text sch;
         ischema_pos  = sch.start;
         ipos         = fst n.nspan;
-        ivalues      = assigns }
+        ivalues      = assigns;
+        idomain      = None }
   | _ -> err "instance shape"
 
 (* ---------- rule / test ---------- *)
@@ -383,7 +385,8 @@ let lower_rule (n : node) : rule_def =
     rschema_pos  = !rschema_pos;
     rpriority    = (match !rpriority with Some p -> p | None -> 0);
     rwhen        = exprs_in (List.rev !when_acc);
-    rthen        = exprs_in (List.rev !then_acc) }
+    rthen        = exprs_in (List.rev !then_acc);
+    rdomain      = None }
 
 let lower_given_block (n : node) : given_block =
   match significant n.nchildren with
@@ -427,25 +430,55 @@ let lower_test (n : node) : test_def =
     | _ -> None) kids in
   match tname_tok, g_block, e_block with
   | Some t, Some g, Some e ->
-      { tname  = tok_string_payload t;
-        tpos   = t.start;          (* anchor at the test's name string *)
-        tgiven = g;
-        texpect = e }
+      { tname    = tok_string_payload t;
+        tpos     = t.start;          (* anchor at the test's name string *)
+        tgiven   = g;
+        texpect  = e;
+        tdomain  = None }
   | _ -> err "test shape"
 
 (* ---------- top-level ---------- *)
 
+(* Pull the IDENT child out of a `domain X:` block. *)
+let domain_name_of (n : node) : ident option =
+  significant n.nchildren
+  |> List.find_map (function
+       | GTok t when is_ident_kind t.kind -> Some (tok_text t)
+       | _ -> None)
+
+(* Tag a freshly-lowered top-level item with its lexical domain. The
+   AST keeps decl names *bare*; the domain is sibling metadata used by
+   resolve / typecheck / Symbol for scoped lookups. *)
+let attach_domain ~domain : top -> top = function
+  | TSchema   s -> TSchema   { s with sdomain = domain }
+  | TRule     r -> TRule     { r with rdomain = domain }
+  | TTest     t -> TTest     { t with tdomain = domain }
+  | TInstance i -> TInstance { i with idomain = domain }
+  | TAction   a -> TAction   { a with asdomain = domain }
+  | (TMeta _ | TInclude _) as other -> other
+
 let lower_program (root : node) : Ast.program =
   if root.nkind <> NProgram then err "program root has wrong kind";
-  List.filter_map (function
+  let rec lower_one ~domain g : top list =
+    match g with
     | GNode n ->
         (match n.nkind with
-         | NMetadata -> Some (TMeta     (lower_metadata    n))
-         | NAction   -> Some (TAction   (lower_action_sig  n))
-         | NSchema   -> Some (TSchema   (lower_schema      n))
-         | NRule     -> Some (TRule     (lower_rule        n))
-         | NTest     -> Some (TTest     (lower_test        n))
-         | NInstance -> Some (TInstance (lower_instance    n))
-         | NInclude  -> Some (TInclude  (lower_include     n))
-         | _ -> None)
-    | GTok _ -> None) root.nchildren
+         | NMetadata -> [TMeta     (lower_metadata    n)]
+         | NAction   -> [attach_domain ~domain (TAction   (lower_action_sig  n))]
+         | NSchema   -> [attach_domain ~domain (TSchema   (lower_schema      n))]
+         | NRule     -> [attach_domain ~domain (TRule     (lower_rule        n))]
+         | NTest     -> [attach_domain ~domain (TTest     (lower_test        n))]
+         | NInstance -> [attach_domain ~domain (TInstance (lower_instance    n))]
+         | NInclude  -> [TInclude  (lower_include     n)]
+         | NDomain   ->
+             (* Phase-1 limit: nested domain blocks flatten into the
+                outermost one (the bare name wins).  We don't yet
+                support hierarchical paths like `foo.bar.X`. *)
+             let inner_domain = match domain_name_of n with
+               | Some _ as d -> d
+               | None -> domain in
+             List.concat_map (lower_one ~domain:inner_domain) n.nchildren
+         | _ -> [])
+    | GTok _ -> []
+  in
+  List.concat_map (lower_one ~domain:None) root.nchildren

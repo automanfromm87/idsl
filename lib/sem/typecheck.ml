@@ -9,16 +9,48 @@ open Typed
 
 type action_param_ty = { pty_name : ident; pty : ty }
 type env = {
-  schemas      : (ident, tschema) Hashtbl.t;
-  actions      : (ident, action_param_ty list) Hashtbl.t;
-  instances    : (ident, ident) Hashtbl.t;
-  fields       : (ident * ty) list;
-  vars         : (ident * ty) list;
-  strict_calls : bool;
+  schemas        : (ident, tschema) Hashtbl.t;
+  actions        : (ident, action_param_ty list) Hashtbl.t;
+  instances      : (ident, ident) Hashtbl.t;
+  fields         : (ident * ty) list;
+  vars           : (ident * ty) list;
+  strict_calls   : bool;
+  current_domain : ident option;
 }
 
 let make_env ?(strict_calls = false) schemas actions instances =
-  { schemas; actions; instances; fields = []; vars = []; strict_calls }
+  { schemas; actions; instances; fields = []; vars = []; strict_calls;
+    current_domain = None }
+
+(* Domain-aware key derivation.  All decl tables (schemas / instances /
+   actions) are keyed on the *qualified* name "domain.bare", with no
+   prefix when the decl is global.  Scoped lookups try the current
+   domain's qualified key first and fall back to the global one. *)
+let qualify (dom : ident option) (name : ident) : ident =
+  match dom with Some d -> d ^ "." ^ name | None -> name
+
+let scoped_find (tbl : (ident, 'a) Hashtbl.t) (env : env) (name : ident)
+    : 'a option =
+  match env.current_domain with
+  | None   -> Hashtbl.find_opt tbl name
+  | Some d ->
+      (match Hashtbl.find_opt tbl (d ^ "." ^ name) with
+       | Some _ as r -> r
+       | None        -> Hashtbl.find_opt tbl name)
+
+let scoped_mem (tbl : (ident, 'a) Hashtbl.t) (env : env) (name : ident)
+    : bool =
+  scoped_find tbl env name <> None
+
+(* Resolve a bare cross-table reference at *storage* time (env not yet
+   built).  Returns the canonical qualified key the table currently
+   uses; falls back to the qualified-with-domain form when neither
+   bucket is populated, so the later type-check raises a clean
+   "unknown" error. *)
+let resolve_key tbl ~domain name =
+  if Hashtbl.mem tbl (qualify domain name) then qualify domain name
+  else if Hashtbl.mem tbl name then name
+  else qualify domain name
 
 let mkdiag ?related pos msg =
   Diagnostic.error ?related ~stage:Diagnostic.Typecheck ~pos msg
@@ -60,7 +92,7 @@ let resolve_var env id =
     match List.assoc_opt id env.fields with
     | Some t -> Some (VarField id, t)
     | None ->
-      match Hashtbl.find_opt env.instances id with
+      match scoped_find env.instances env id with
       | Some sname -> Some (VarInstance id, TSchema sname)
       | None -> None
 
@@ -74,7 +106,7 @@ let rec infer env e : texpr =
       (match resolve_var env id with
        | Some (v, t) -> mk (TVar v) t
        | None ->
-         let ty = if Hashtbl.mem env.schemas id then TSchema id else TTag id in
+         let ty = if scoped_mem env.schemas env id then TSchema id else TTag id in
          mk (TVar (VarTag id)) ty)
   | EField (obj, fpos, f) ->
       let to_ = infer env obj in
@@ -149,7 +181,7 @@ and field_type ?pos env ot f =
   in
   match ot with
   | TSchema s ->
-      (match Hashtbl.find_opt env.schemas s with
+      (match scoped_find env.schemas env s with
        | Some ts -> look_in ts.ts_types
        | None    -> err "%sunknown schema %s" prefix s)
   | TObject kvs     -> look_in kvs
@@ -244,7 +276,7 @@ and check env e expected : texpr =
       te
 
 and check_object_fits env s kvs =
-  match Hashtbl.find_opt env.schemas s with
+  match scoped_find env.schemas env s with
   | None -> err "unknown schema %s" s
   | Some ts ->
       List.map (fun (k, v) ->
@@ -254,14 +286,15 @@ and check_object_fits env s kvs =
 
 (* ---------- schemas ---------- *)
 
-let infer_example schemas = function
+let infer_example ?domain schemas = function
   | ExLit l     -> infer_lit l, `Lit l
   | ExEnum tags ->
       if tags = [] then err "empty enum"
       else TEnum tags, `Enum tags
   | ExList es ->
-      let env = make_env schemas
+      let base = make_env schemas
         (Hashtbl.create 0) (Hashtbl.create 0) in
+      let env = { base with current_domain = domain } in
       let tes = List.map (infer env) es in
       let elem = List.fold_left (fun acc te -> unify acc te.ty) TAny tes in
       TList elem, `List tes
@@ -271,7 +304,7 @@ let typecheck_schema schemas actions sch =
   let push d = errors := d :: !errors in
   let raw_pairs = List.filter_map (function
     | FRaw (pos, n, ex) ->
-        (try Some (n, fst (infer_example schemas ex))
+        (try Some (n, fst (infer_example ?domain:sch.sdomain schemas ex))
          with Type_error m ->
            push (mkdiag pos
              (Printf.sprintf "schema %s.%s: %s" sch.sname n m));
@@ -289,7 +322,8 @@ let typecheck_schema schemas actions sch =
     List.fold_left (fun (dacc, tyacc) (n, e) ->
       let env =
         { schemas; actions; instances = Hashtbl.create 0;
-          fields = tyacc; vars = []; strict_calls = false } in
+          fields = tyacc; vars = []; strict_calls = false;
+          current_domain = sch.sdomain } in
       match (try `Ok (infer env e) with Type_error m -> `Err m) with
       | `Ok te -> ((n, te) :: dacc, tyacc @ [(n, te.ty)])
       | `Err m ->
@@ -317,7 +351,7 @@ let pick_schema_for_rule env r =
   let referenced = ref [] in
   let collect (_, e) =
     Ast.iter_expr (function
-      | EVar id when not (Hashtbl.mem env.schemas id) ->
+      | EVar id when not (scoped_mem env.schemas env id) ->
           if not (List.mem id !referenced) then referenced := id :: !referenced
       | EVar _ | ELit _ | EList _ | EObject _ | EWildcard | EMissing
       | EUnary _ | EBin _ | EIf _ | EAny _ | EEvery _ | ECount _ | ESum _
@@ -347,7 +381,7 @@ let typecheck_call env (e : expr) : tcall =
   match e.e_node with
   | ECall (name, args) ->
       let targs = List.map (infer env) args in
-      (match Hashtbl.find_opt env.actions name with
+      (match scoped_find env.actions env name with
        | None ->
            if env.strict_calls then
              err "action `%s` has no @action declaration (strict mode)" name;
@@ -368,14 +402,17 @@ let typecheck_call env (e : expr) : tcall =
   | EIsMissing _ | EIsPresent _ -> err "expected a call expression"
 
 let typecheck_rule env r =
+  let env = { env with current_domain = r.rdomain } in
   let where = String.concat "." r.rpath in
   let sname = match r.rschema with
     | Some s ->
-        if not (Hashtbl.mem env.schemas s) then
+        if not (scoped_mem env.schemas env s) then
           err_at r.rpos "rule %s on %s: unknown schema" where s;
         s
     | None -> pick_schema_for_rule env r in
-  let ts = Hashtbl.find env.schemas sname in
+  let ts = match scoped_find env.schemas env sname with
+    | Some t -> t
+    | None -> err_at r.rpos "rule %s: schema %s not found" where sname in
   let env' = { env with fields = ts.ts_types } in
   let twhen = List.map (fun (pos, p) ->
     if has_wildcard p then
@@ -392,8 +429,9 @@ let typecheck_rule env r =
 (* ---------- tests ---------- *)
 
 let typecheck_test env t =
+  let env = { env with current_domain = t.tdomain } in
   let sname = t.tgiven.gschema in
-  let ts = match Hashtbl.find_opt env.schemas sname with
+  let ts = match scoped_find env.schemas env sname with
     | Some s -> s
     | None   -> err_at t.tpos "test %S: unknown schema %s" t.tname sname in
   let env_g = { env with fields = ts.ts_types } in
@@ -422,7 +460,8 @@ let typecheck_test env t =
     tt_expect = expects }
 
 let typecheck_instance env i =
-  let ts = match Hashtbl.find_opt env.schemas i.ischema with
+  let env = { env with current_domain = i.idomain } in
+  let ts = match scoped_find env.schemas env i.ischema with
     | Some s -> s
     | None   -> err_at i.ipos "instance %s: unknown schema %s" i.iname i.ischema in
   let env_g = { env with fields = ts.ts_types } in
@@ -504,27 +543,32 @@ let run program =
     match with_diag a.aspos (fun () -> typecheck_action schemas a) with
     | `Err d -> push d
     | `Ok (n, params) ->
-        if Hashtbl.mem actions n then
-          push (mkdiag a.aspos (Printf.sprintf "duplicate @action %s" n))
+        let key = qualify a.asdomain n in
+        if Hashtbl.mem actions key then
+          push (mkdiag a.aspos (Printf.sprintf "duplicate @action %s" key))
         else begin
-          Hashtbl.add actions n params;
-          action_decls := { ta_name = n;
+          Hashtbl.add actions key params;
+          action_decls := { ta_name = key;
                             ta_params = List.map (fun p -> (p.pty_name, p.pty)) params;
                             ta_pos = a.aspos } :: !action_decls
         end) (Ast.actions program);
   let schema_pos : (ident, Lexing.position) Hashtbl.t = Hashtbl.create 16 in
   let tschemas =
     List.filter_map (fun s ->
-      Hashtbl.replace schema_pos s.sname s.spos;
+      let key = qualify s.sdomain s.sname in
+      Hashtbl.replace schema_pos key s.spos;
       let tsch, errs = typecheck_schema schemas actions s in
-      Hashtbl.replace schemas tsch.ts_name tsch;
+      Hashtbl.replace schemas key tsch;
       List.iter push errs;
       Some tsch) (Ast.schemas program) in
   check_unique_enum_tags errors schema_pos tschemas;
   List.iter (fun i ->
-    if Hashtbl.mem instances i.iname then
-      push (mkdiag i.ipos (Printf.sprintf "duplicate instance %s" i.iname))
-    else Hashtbl.add instances i.iname i.ischema)
+    let key = qualify i.idomain i.iname in
+    if Hashtbl.mem instances key then
+      push (mkdiag i.ipos (Printf.sprintf "duplicate instance %s" key))
+    else
+      let schema_key = resolve_key schemas ~domain:i.idomain i.ischema in
+      Hashtbl.add instances key schema_key)
     (Ast.instances program);
   let strict_calls =
     List.exists (function

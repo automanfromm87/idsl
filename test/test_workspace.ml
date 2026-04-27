@@ -560,6 +560,52 @@ let test_document_symbol_only_local_file () =
   ignore path_a;
   teardown ()
 
+(* ---------------- Test 12: domain blocks scope same-name decls ---- *)
+
+(* `domain shipping: schema Item …` and `domain billing: schema Item …`
+   should both compile cleanly — qualified names in the index keep the
+   two distinct.  Without scope semantics, this would error as
+   `duplicate schema "Item"`. *)
+let test_domain_scopes_same_name () =
+  let src = {|domain shipping:
+  schema Item:
+    - X: e.g. 1
+
+domain billing:
+  schema Item:
+    - Y: e.g. true
+|} in
+  let s = IDSL.Session.compile_string src in
+  check "[dom] same-name schemas in two domains compile"
+    (s.diagnostics = [] && s.typed <> None);
+
+  match Session.index s with
+  | None -> check "[dom] index built" false
+  | Some idx ->
+      let names = IDSL.Semantic_index.all_symbols idx
+        |> List.filter (fun s ->
+             match s.IDSL.Symbol.kind with
+             | KSchema _ -> true | _ -> false)
+        |> List.map (fun s -> s.IDSL.Symbol.label)
+        |> List.sort compare in
+      check "[dom] both qualified schemas appear in the index"
+        (names = ["schema billing.Item"; "schema shipping.Item"])
+
+(* ---------------- Test 13: domain prevents cross-domain leakage --- *)
+
+let test_domain_blocks_cross_reference () =
+  let src = {|domain shipping:
+  schema Item:
+    - X: e.g. 1
+
+domain billing:
+  schema Invoice:
+    - Lines: e.g. [Item]   (* should fail — Item is in shipping *)
+|} in
+  let s = IDSL.Session.compile_string src in
+  check "[dom-x] cross-domain reference is rejected"
+    (s.diagnostics <> [])
+
 let () =
   Printf.printf "\n--- workspace regressions ---\n";
   test_multifile_include ();
@@ -573,5 +619,7 @@ let () =
   test_folder_scan_includes_closed_files ();
   test_rename_two_hop_includes ();
   test_document_symbol_only_local_file ();
+  test_domain_scopes_same_name ();
+  test_domain_blocks_cross_reference ();
   Printf.printf "%d passed, %d failed\n" !pass !fail;
   if !fail > 0 then exit 1

@@ -1,0 +1,64 @@
+# iDSL example — `domain` keyword for namespacing.
+#
+# Two unrelated business areas in the same file. Each `domain` block
+# scopes its declarations: same bare name across domains is fine, but
+# references inside a domain only see same-domain names + global ones.
+
+@version("0.0.1")
+
+# Actions are global — both domains call into them.
+@action flag(severity: {info|warn|alert}, reason: String)
+@action notify(team: String)
+
+# Schemas at the top level (no `domain` block) are global; both
+# domains can reference them.
+schema Money2:
+  - Amount: e.g. $100
+
+# ── shipping domain ────────────────────────────────────────────────────
+
+domain shipping:
+  schema Item:
+    - SKU:    e.g. "WIDGET-A"
+    - Weight: e.g. 1.5
+    - Value:  e.g. $50
+
+  schema Order:
+    - ID:    e.g. "ORD-1001"
+    - Items: e.g. [Item]              # same-domain ref, bare name OK
+    - Total: e.g. $5,000
+
+    - HeavyKgs:    i.e. sum of x.Weight for x in Items where true
+    - IsExpensive: i.e. Total > $1,000
+
+  rule shipping.alert.expensive on Order:
+    when:
+      IsExpensive
+    then:
+      flag(alert, "ship-expensive")
+
+  test "expensive order alerts":
+    given Order:
+      ID = "x"
+      Items = []
+      Total = $2000
+    expect:
+      flag(alert, "ship-expensive")
+
+# ── billing domain ─────────────────────────────────────────────────────
+# Reuses the bare name `Item`; no conflict with shipping.Item.
+
+domain billing:
+  schema Item:
+    - SKU:   e.g. "BILL-A"
+    - Price: e.g. $20
+
+  schema Invoice:
+    - ID:    e.g. "INV-2002"
+    - Lines: e.g. [Item]              # billing.Item, not shipping.Item
+
+  rule billing.alert.empty on Invoice:
+    when:
+      true
+    then:
+      flag(info, "invoice-touched")

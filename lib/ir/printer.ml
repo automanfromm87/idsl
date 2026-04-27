@@ -64,7 +64,7 @@ let rec pp_ty_annot = function
 let pp_top = function
   | TMeta { mkey; mvalue } ->
       Printf.sprintf "@%s(%S)" mkey mvalue
-  | TAction { asname; asparams; aspos = _ } ->
+  | TAction { asname; asparams; _ } ->
       let ps = String.concat ", "
         (List.map (fun p ->
            Printf.sprintf "%s: %s" p.pname (pp_ty_annot p.ptype))
@@ -77,10 +77,10 @@ let pp_top = function
         (List.map (fun a ->
            Printf.sprintf "  %s = %s" a.aname (pp_expr a.avalue)) ivalues) in
       Printf.sprintf "instance %s %s:\n%s" ischema iname body
-  | TSchema { sname; sfields; spos = _ } ->
+  | TSchema { sname; sfields; _ } ->
       Printf.sprintf "schema %s:\n%s"
         sname (String.concat "\n" (List.map pp_field sfields))
-  | TTest { tname; tgiven; texpect; tpos = _ } ->
+  | TTest { tname; tgiven; texpect; _ } ->
       let givens = indent_lines "    "
         (List.map (fun a ->
           Printf.sprintf "%s = %s" a.aname (pp_expr a.avalue)) tgiven.gvalues) in

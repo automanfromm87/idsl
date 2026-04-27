@@ -23,7 +23,7 @@ let opt = function Some x -> [x] | None -> []
 %token <Cst.tok> MIN MAX
 %token <Cst.tok> EG IE
 %token <Cst.tok> TEST GIVEN EXPECT
-%token <Cst.tok> ACTION INSTANCE ON PRIORITY INCLUDE
+%token <Cst.tok> ACTION INSTANCE ON PRIORITY INCLUDE DOMAIN
 %token <Cst.tok> COLON COMMA LPAREN RPAREN LBRACKET RBRACKET LBRACE RBRACE
 %token <Cst.tok> DOT AT PIPE
 %token <Cst.tok> EQEQ NEQ LEQ GEQ LT GT EQ UNDERSCORE
@@ -80,13 +80,23 @@ dot_seq_ident:
   | x=IDENT d=DOT rest=dot_seq_ident { g x :: g d :: rest }
 
 program:
-  | leading=nls items=top_seq eof=EOF
+  | leading=nls items=program_seq eof=EOF
     { mk Cst.NProgram $startpos $endpos
         (gs leading @ items @ [g eof]) }
 
-(* `top_seq` flattens each top-level item with its trailing newlines into
-   a `green list` so we don't double-wrap (`NMetadata` containing a child
-   that is itself the real `NMetadata`). *)
+(* `program_seq` flattens program-level items + trailing newlines into a
+   green list so we don't double-wrap.  The split between
+   `program_item` and `top` exists so `domain X:` is only allowed at
+   program level — preventing nested `top_seq` recursion that otherwise
+   produces an unbounded shift/reduce conflict. *)
+program_seq:
+  | { [] }
+  | it=program_item trail=nls rest=program_seq { (it :: gs trail) @ rest }
+
+program_item:
+  | t=top         { t }
+  | d=domain_def  { d }
+
 top_seq:
   | { [] }
   | t=top trail=nls rest=top_seq { (t :: gs trail) @ rest }
@@ -103,6 +113,14 @@ top:
 include_dir:
   | inc=INCLUDE p=STRING
     { mk Cst.NInclude $startpos $endpos [g inc; g p] }
+
+(* `domain X:` block: scopes every nested decl under the domain.
+   Body is `top_seq`; nesting is grammatically disallowed because
+   `domain_def` is only reachable from `program_item`. *)
+domain_def:
+  | dk=DOMAIN name=IDENT c=COLON n0=nls items=top_seq
+    { mk Cst.NDomain $startpos $endpos
+        ([g dk; g name; g c] @ gs n0 @ items) }
 
 instance_def:
   | inst=INSTANCE sch=IDENT name=IDENT c=COLON n0=nls assigns=list(given_assign)

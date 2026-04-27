@@ -57,35 +57,46 @@ let add_ref idx (kind : Symbol.kind) ?(length = 1) (p : Lexing.position) =
    while we hand the CST to future binder-pass extensions (e.g.
    action-param symbols, which still rely on CST tokens). *)
 
+(* Domain-qualified name: "shipping.Order" inside `domain shipping:`,
+   or just "Order" at the top level.  Symbol.kind reuses its existing
+   string slot to hold the qualified form, so two same-bare-name decls
+   in different domains produce distinct Symbol values. *)
+let qualify (dom : Ast.ident option) (name : Ast.ident) : Ast.ident =
+  match dom with Some d -> d ^ "." ^ name | None -> name
+
 let collect_decls idx (prog : Ast.program) (_root : Cst.node) =
   let mk kind pos label_kind =
     add_symbol idx
       { kind; decl_pos = pos; label = Symbol.label_of_kind label_kind } in
   List.iter (function
     | Ast.TSchema s ->
-        let k = Symbol.KSchema s.sname in
+        let q = qualify s.sdomain s.sname in
+        let k = Symbol.KSchema q in
         mk k s.spos k;
         List.iter (fun f ->
           let pos, name = match f with
             | Ast.FRaw (p, n, _)     -> p, n
             | Ast.FDerived (p, n, _) -> p, n in
-          let k = Symbol.KField (s.sname, name) in
+          let k = Symbol.KField (q, name) in
           mk k pos k) s.sfields
     | Ast.TRule r ->
-        (* The rule's identity is the joined dotted path; its decl_pos
-           is the *first* segment's position. Each segment's individual
-           ref site is recorded by `collect_decl_refs` below. *)
         let pos = match r.rpath_locs with p :: _ -> p | [] -> r.rpos in
-        let k = Symbol.KRule r.rpath in
+        let path = match r.rdomain with
+          | Some d -> d :: r.rpath
+          | None   -> r.rpath in
+        let k = Symbol.KRule path in
         mk k pos k
     | Ast.TTest t ->
-        let k = Symbol.KTest t.tname in
+        let q = qualify t.tdomain t.tname in
+        let k = Symbol.KTest q in
         mk k t.tpos k
     | Ast.TInstance i ->
-        let k = Symbol.KInstance i.iname in
+        let q = qualify i.idomain i.iname in
+        let k = Symbol.KInstance q in
         mk k i.iname_pos k
     | Ast.TAction a ->
-        let k = Symbol.KAction a.asname in
+        let q = qualify a.asdomain a.asname in
+        let k = Symbol.KAction q in
         mk k a.aspos k
     | Ast.TMeta _ | Ast.TInclude _ -> ()) prog
 
