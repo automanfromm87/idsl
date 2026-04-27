@@ -57,7 +57,11 @@ let parse_lexbuf lexbuf : (Ast.program, Diagnostic.t) result * Cst.tok list * Cs
       (Error d, tokens, Cst.flat_tree tokens)
 
 (* On parse failure we want a complete token stream for fmt / completion;
-   re-lex the source from scratch and return the resulting flat tree. *)
+   re-lex the source and recover from lexer errors by capturing the
+   offending bytes as opaque whitespace-trivia so the CST keeps every
+   byte of the original input.  Without this, fmt would silently
+   truncate any source containing an un-lexable character — a
+   regression caught by the property suite. *)
 let cst_of_failed_source (s : string) : Cst.tok list * Cst.node =
   let lb = Lexing.from_string s in
   Lexer.reset ();
@@ -65,9 +69,22 @@ let cst_of_failed_source (s : string) : Cst.tok list * Cst.node =
     match Lexer.token lb with
     | EOF _ -> ()
     | _ -> drain ()
-    | exception _ -> ()
+    | exception _ ->
+        (* The lexer's catch-all `_` rule matched one byte and then
+           raised; ocamllex has already advanced lex_curr_pos past it,
+           so lex_start_pos points at the byte we want to preserve. *)
+        if lb.lex_start_pos < lb.lex_buffer_len then begin
+          let bad =
+            Bytes.sub_string lb.lex_buffer lb.lex_start_pos 1 in
+          Cst.pending_leading :=
+            { Cst.trk_kind = Whitespace;
+              trk_text = bad;
+              trk_pos  = lb.lex_start_p;
+            } :: !Cst.pending_leading;
+          drain ()
+        end
   in
-  (try drain () with _ -> ());
+  drain ();
   let tokens = Cst.snapshot () in
   (tokens, Cst.flat_tree tokens)
 

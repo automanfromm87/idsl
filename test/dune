@@ -7,6 +7,10 @@
  (name test_workspace)
  (libraries iDSL unix))
 
+(test
+ (name test_properties)
+ (libraries iDSL qcheck-core))
+
 (executable
  (name recov_test)
  (libraries iDSL))
