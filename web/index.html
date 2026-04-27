@@ -1,0 +1,868 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>iDSL — playground</title>
+<style>
+  body { font: 14px/1.5 -apple-system, system-ui, sans-serif;
+         max-width: 1400px; margin: 1em auto; padding: 0 1em; color: #222; }
+  h1 { margin: 0 0 .25em; font-size: 22px; }
+  h2 { margin: 1em 0 .5em; font-size: 13px; text-transform: uppercase;
+       letter-spacing: .08em; color: #666; border-bottom: 1px solid #ddd; padding-bottom: .25em; }
+  .grid { display: grid; grid-template-columns: 1.4fr 1fr; gap: 1em; }
+  #editor { height: 540px; border: 1px solid #ccc; border-radius: 4px; }
+  textarea.input { width: 100%; box-sizing: border-box; font: 12.5px ui-monospace, Menlo, monospace;
+             padding: .6em; border: 1px solid #ccc; border-radius: 4px; resize: vertical; height: 250px; }
+  .controls { display: flex; gap: .5em; align-items: center; margin: .75em 0; flex-wrap: wrap; }
+  button { padding: .45em .9em; font: inherit; cursor: pointer;
+           border: 1px solid #888; background: #f4f4f4; border-radius: 4px; }
+  button:hover { background: #e8e8e8; }
+  button.primary { background: #2266dd; color: white; border-color: #1a52b6; }
+  button.primary:hover { background: #1a52b6; }
+  select { padding: .35em .5em; font: inherit;
+           border: 1px solid #ccc; border-radius: 4px; }
+  pre.out { background: #f7f7f7; padding: .8em; border-radius: 4px;
+            white-space: pre-wrap; word-break: break-word; font: 12.5px ui-monospace, Menlo, monospace;
+            margin: 0; max-height: 700px; overflow: auto; }
+  .ok  { color: #1a8c3a; font-weight: 600; }
+  .err { color: #c63232; font-weight: 600; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 8px;
+          font-size: 11px; font-weight: 600; }
+  .fired   { background: #1a8c3a; color: white; }
+  .skipped { background: #888; color: white; }
+  .added   { color: #1a8c3a; }
+  .removed { color: #c63232; }
+  .rule    { border: 1px solid #ddd; border-radius: 6px; padding: .65em .8em; margin-bottom: .6em; }
+  .rule-head { font-weight: 600; margin-bottom: .35em; }
+  .pred { margin: .3em 0 .3em 1em; }
+  .pred .mark { display: inline-block; width: 1.2em; }
+  .bind { color: #666; margin-left: 2.4em; font-size: 12.5px; }
+  .formula { color: #555; font-style: italic; }
+  .empty { color: #999; font-style: italic; }
+</style>
+<link rel="stylesheet" data-name="vs/editor/editor.main"
+      href="https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs/editor/editor.main.css">
+</head>
+<body>
+
+<h1>iDSL playground</h1>
+<div style="color:#666; margin-bottom:1em">
+  Type-checked, syntax-highlighted source on the left. JSON input on the
+  right. Errors appear inline (red squiggle) as you type. Hover any
+  identifier for its inferred type. All evaluation runs client-side.
+</div>
+
+<div class="grid">
+  <div>
+    <h2>DSL source</h2>
+    <div id="editor"></div>
+  </div>
+  <div>
+    <h2>Input JSON (run / explain / diff "after")</h2>
+    <textarea id="input" class="input" spellcheck="false"></textarea>
+    <h2>Diff "before" JSON</h2>
+    <textarea id="before" class="input" spellcheck="false"></textarea>
+  </div>
+</div>
+
+<div class="controls">
+  <span>Schema:</span>
+  <select id="schema"></select>
+  <button id="btnRun" class="primary">Run</button>
+  <button id="btnExplain">Explain</button>
+  <button id="btnTest">Run tests</button>
+  <button id="btnDiff">Diff before → input</button>
+  <span id="status" style="margin-left:.5em"></span>
+</div>
+
+<h2>Output</h2>
+<pre class="out" id="out">(start typing — diagnostics appear inline)</pre>
+
+<script src="idsl_js.bc.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs/loader.js"></script>
+<script>
+'use strict';
+
+const DEFAULT_SRC = `@version("0.0.1")
+
+@action flag(severity: {info|warn|alert}, reason: String)
+@action route(channel: {ground|air|express|freight})
+@action notify(team: String)
+
+schema Item:
+  - SKU:    e.g. "WIDGET-A"
+  - Weight: e.g. 1.5
+  - Value:  e.g. $50
+
+schema Order:
+  - ID:           e.g. "ORD-1001"
+  - Tier:         e.g. Standard, Priority, Express
+  - Origin:       e.g. East, West, Central, Overseas
+  - Destination:  e.g. East, West, Central, Overseas
+  - PlacedDate:   e.g. 2025-01-15
+  - DueDate:      e.g. 2025-01-25
+  - Insured:      e.g. true
+  - Items:        e.g. [Item]
+
+  - TotalWeight: i.e. sum of x.Weight for x in Items where true
+  - TotalValue:  i.e. sum of x.Value  for x in Items where true
+  - LeadDays:    i.e. (DueDate - PlacedDate).days
+  - IsHeavy:     i.e. TotalWeight > 50
+  - IsHighValue: i.e. TotalValue  > $5,000
+  - IsOverseas:  i.e. (Origin == Overseas or Destination == Overseas)
+
+rule shipping.tier.express on Order priority 10:
+  when:
+    Tier == Express
+  then:
+    route(express)
+    flag(info, "express handling")
+
+rule shipping.weight.heavy on Order priority 5:
+  when:
+    IsHeavy
+  then:
+    route(freight)
+
+rule shipping.value.uninsured on Order:
+  when:
+    IsHighValue
+    not Insured
+  then:
+    flag(alert, "high-value uninsured")
+    notify("ops")
+
+test "high-value uninsured triggers alert":
+  given Order:
+    Tier = Standard
+    Insured = false
+    Items = [{SKU: "GOLD", Weight: 1, Value: $10000}]
+    PlacedDate = 2025-01-15
+    DueDate = 2025-01-25
+  expect:
+    flag(alert, "high-value uninsured")
+`;
+
+const DEFAULT_INPUT = JSON.stringify({
+  ID: "ORD-1001", Tier: "Standard",
+  Origin: "East", Destination: "West",
+  PlacedDate: "2025-01-15", DueDate: "2025-01-25",
+  Insured: false,
+  Items: [{SKU: "GOLD", Weight: 1, Value: "$10000"}]
+}, null, 2);
+
+const DEFAULT_BEFORE = JSON.stringify({
+  ID: "ORD-1001", Tier: "Standard",
+  Origin: "East", Destination: "West",
+  PlacedDate: "2025-01-15", DueDate: "2025-01-25",
+  Insured: true,
+  Items: [{SKU: "GOLD", Weight: 1, Value: "$10000"}]
+}, null, 2);
+
+document.getElementById('input').value  = DEFAULT_INPUT;
+document.getElementById('before').value = DEFAULT_BEFORE;
+
+const $ = id => document.getElementById(id);
+const out = x => { $('out').textContent = (typeof x === 'string') ? x : JSON.stringify(x, null, 2); };
+const outHtml = h => { $('out').innerHTML = h; };
+const setStatus = (msg, ok) => {
+  const s = $('status');
+  s.textContent = msg;
+  s.className = ok === true ? 'ok' : (ok === false ? 'err' : '');
+};
+const escapeHtml = s => String(s).replace(/[&<>"']/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+let editor = null;
+let prog = null;
+
+function refreshSchemas() {
+  const sel = $('schema');
+  sel.innerHTML = '';
+  if (!prog) return;
+  for (const s of prog.schemas) {
+    const o = document.createElement('option');
+    o.value = o.textContent = s;
+    sel.appendChild(o);
+  }
+  const c = Array.from(sel.options).find(o => o.value === 'Order');
+  if (c) sel.value = 'Order';
+}
+
+// Re-typecheck the editor's content and update Monaco's diagnostic markers
+// + the cached `prog` handle.
+function recompile(monaco) {
+  const src = editor.getValue();
+  const r = IDSL.compile(src);
+  if (r.ok) {
+    prog = r.program;
+    refreshSchemas();
+    setStatus(`compiled — ${prog.schemas.length} schema(s), ${prog.rules.length} rule(s), ${prog.tests.length} test(s)`, true);
+    // Hint-severity markers for unused symbols, with the Unnecessary tag
+    // so the editor renders them dimmed.
+    const unused = Array.from(prog.unused_diagnostics()).map(u => ({
+      severity:        2,                         // 2 = Hint
+      message:         u.message,
+      startLineNumber: u.line + 1,
+      startColumn:     u.character + 1,
+      endLineNumber:   u.line + 1,
+      endColumn:       u.character + 1 + u.length,
+      tags:            [1],                       // 1 = Unnecessary
+      source:          'idsl-lint',
+    }));
+    monaco.editor.setModelMarkers(editor.getModel(), 'idsl', unused);
+  } else {
+    prog = null;
+    refreshSchemas();
+    // Use the structured diagnostics array (line/column/endLine/endColumn
+    // already in LSP coords) — no more regex over error strings.
+    const markers = (r.diagnostics ? Array.from(r.diagnostics) : [])
+      .map(d => ({
+        severity:        d.severity === 'error' ? 8
+                       : d.severity === 'warning' ? 4 : 2,
+        message:         `${d.stage}: ${d.message}`,
+        startLineNumber: d.line + 1,
+        startColumn:     d.column + 1,
+        endLineNumber:   d.endLine + 1,
+        endColumn:       d.endColumn + 1,
+      }));
+    setStatus(`${r.errors.length} error(s)`, false);
+    monaco.editor.setModelMarkers(editor.getModel(), 'idsl', markers);
+  }
+}
+
+// Legacy fallback parser, retained for older flows that still pass strings.
+function parseDiagnostic(msg) {
+  const m = msg.match(/line (\d+), col (\d+): (.+)$/);
+  if (!m) {
+    return { severity: 8, message: msg, startLineNumber: 1, startColumn: 1, endLineNumber: 1, endColumn: 2 };
+  }
+  const line = parseInt(m[1], 10);
+  const col  = parseInt(m[2], 10);
+  return {
+    severity: 8,
+    message: m[3],
+    startLineNumber: line, startColumn: col,
+    endLineNumber:   line, endColumn:   col + 1,
+  };
+}
+
+function parseInputOrError(id) {
+  try { return [JSON.parse($(id).value), null]; }
+  catch (e) { return [null, e.message]; }
+}
+
+require.config({ paths: { vs: 'https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs' }});
+require(['vs/editor/editor.main'], function () {
+
+  // Monarch tokenizer for syntax highlighting
+  monaco.languages.register({ id: 'idsl' });
+  monaco.languages.setLanguageConfiguration('idsl', {
+    comments: { lineComment: '#' },
+    brackets: [['(', ')'], ['[', ']'], ['{', '}']],
+    autoClosingPairs: [
+      { open: '(', close: ')' },
+      { open: '[', close: ']' },
+      { open: '{', close: '}' },
+      { open: '"', close: '"' },
+    ],
+    // Treat `@foo` as a single word so completion can filter `@action`
+    // / `@version` etc. against the partial `@a` the user has typed.
+    wordPattern: /(@?[A-Za-z_][\w]*)/,
+  });
+  monaco.languages.setMonarchTokensProvider('idsl', {
+    keywords: ['schema','rule','test','instance','action','include','when','then',
+               'given','expect','on','priority','if','else','and','or','not',
+               'any','every','count','sum','of','in','where','is','missing',
+               'present','true','false','min','max','for'],
+    typeKeywords: ['Int','Float','Bool','String','Money','Date','Duration'],
+    operators: ['==','!=','<=','>=','<','>','+','-','*','/','='],
+    tokenizer: {
+      root: [
+        [/#.*$/, 'comment'],
+        [/"""/, { token: 'string.quoted.triple', next: '@tstring' }],
+        [/"([^"\\]|\\.)*"/, 'string'],
+        [/\$[0-9][0-9,]*(\.[0-9]+)?/, 'number.money'],
+        [/\b\d{4}-\d{2}-\d{2}\b/, 'number.date'],
+        [/\b\d+(\.\d+)?\b/, 'number'],
+        [/@[A-Za-z_][\w]*/, 'tag'],
+        [/\b(e\.g\.|i\.e\.)/, 'keyword'],
+        [/[A-Z][\w]*/, {
+          cases: { '@typeKeywords': 'type', '@default': 'type.identifier' }
+        }],
+        [/[a-z_][\w]*/, {
+          cases: { '@keywords': 'keyword', '@default': 'identifier' }
+        }],
+        [/==|!=|<=|>=|<|>|\+|-|\*|\/|=/, 'operator'],
+        [/[(){}\[\]]/, '@brackets'],
+        [/[ \t\r\n]+/, ''],
+      ],
+      tstring: [
+        [/[^"]+/, 'string.quoted.triple'],
+        [/"""/, { token: 'string.quoted.triple', next: '@pop' }],
+        [/"/, 'string.quoted.triple'],
+      ],
+    },
+  });
+
+  // Hover provider — calls the OCaml `Lsp_query.hover_at` via JSOO.
+  // Monaco positions are 1-indexed (line) and 1-indexed (column).
+  // Our internal positions are 0-indexed for both. Convert.
+  monaco.languages.registerHoverProvider('idsl', {
+    provideHover: function (model, position) {
+      if (!prog) return null;
+      const word = model.getWordAtPosition(position);
+      const ch = (word ? word.startColumn : position.column) - 1;
+      const txt = prog.hover_at(position.lineNumber - 1, ch);
+      if (!txt) return null;
+      const start = word ? word.startColumn : position.column;
+      const end   = word ? word.endColumn   : position.column;
+      return {
+        range:    new monaco.Range(position.lineNumber, start,
+                                   position.lineNumber, end),
+        contents: [{ value: '```idsl\n' + txt + '\n```' }],
+      };
+    },
+  });
+
+  // Definition provider — jump to schema / rule / instance / field decl.
+  monaco.languages.registerDefinitionProvider('idsl', {
+    provideDefinition: function (model, position) {
+      if (!prog) return null;
+      const word = model.getWordAtPosition(position);
+      const ch = (word ? word.startColumn : position.column) - 1;
+      const d = prog.def_at(model.getValue(),
+                            position.lineNumber - 1, ch);
+      if (!d) return null;
+      return {
+        uri: model.uri,
+        range: new monaco.Range(
+          d.line + 1, d.character + 1,
+          d.line + 1, d.character + 1 + (word ? (word.endColumn - word.startColumn) : 1)
+        ),
+      };
+    },
+  });
+
+  // Completion provider with snippets + lazy-resolved documentation.
+  monaco.languages.registerCompletionItemProvider('idsl', {
+    triggerCharacters: ['.', '=', '(', ',', ' ', '@'],
+    provideCompletionItems: function (model, position) {
+      if (!prog) return { suggestions: [] };
+      const items = prog.completions_at(model.getValue(),
+                                        position.lineNumber - 1,
+                                        position.column - 1);
+      const word = model.getWordUntilPosition(position);
+      const range = new monaco.Range(position.lineNumber, word.startColumn,
+                                     position.lineNumber, word.endColumn);
+      return {
+        suggestions: Array.from(items).map(it => {
+          const sug = {
+            label:      it.label,
+            kind:       it.kind,
+            detail:     it.detail || '',
+            insertText: it.insertText || it.label,
+            range:      range,
+          };
+          if (it.isSnippet) {
+            // monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet = 4
+            sug.insertTextRules = 4;
+          }
+          if (it.dataId) {
+            // Stash the id so resolveCompletionItem can look it up later.
+            sug._dataId = it.dataId;
+          }
+          return sug;
+        }),
+      };
+    },
+    // Lazy doc lookup — only fired when the user hovers a list entry.
+    resolveCompletionItem: function (item) {
+      if (!prog || !item._dataId) return item;
+      const md = prog.resolve_completion(item._dataId);
+      if (md) {
+        item.documentation = { value: md, isTrusted: false };
+      }
+      return item;
+    },
+  });
+
+  // ====================================================================
+  // Round-1 / Round-2 LSP-style providers.
+  // Internal positions are LSP-style 0-indexed; Monaco is 1-indexed.
+  // Conversion happens inline below at every provider boundary.
+  // ====================================================================
+
+  // tiny helper: LSP-style {start,end} ranges → Monaco.Range
+  function rng(r) {
+    return new monaco.Range(
+      r.start.line + 1, r.start.character + 1,
+      r.end.line   + 1, r.end.character   + 1
+    );
+  }
+
+  // textDocument/references
+  monaco.languages.registerReferenceProvider('idsl', {
+    provideReferences: function (model, position) {
+      if (!prog) return [];
+      const refs = prog.references_at(position.lineNumber - 1,
+                                      position.column - 1);
+      return Array.from(refs).map(r => ({
+        uri: model.uri,
+        range: new monaco.Range(
+          r.line + 1, r.character + 1,
+          r.line + 1, r.character + 1 + r.length
+        ),
+      }));
+    },
+  });
+
+  // textDocument/documentSymbol  → outline pane on the right
+  monaco.languages.registerDocumentSymbolProvider('idsl', {
+    provideDocumentSymbols: function () {
+      if (!prog) return [];
+      const toMonaco = s => ({
+        name: s.name,
+        detail: s.detail || '',
+        kind: s.kind,
+        range: rng(s.range),
+        selectionRange: rng(s.selectionRange),
+        children: Array.from(s.children).map(toMonaco),
+        tags: [],
+      });
+      return Array.from(prog.document_symbols()).map(toMonaco);
+    },
+  });
+
+  // textDocument/documentHighlight  → cursor co-highlight
+  monaco.languages.registerDocumentHighlightProvider('idsl', {
+    provideDocumentHighlights: function (model, position) {
+      if (!prog) return [];
+      const hs = prog.document_highlights_at(position.lineNumber - 1,
+                                             position.column - 1);
+      return Array.from(hs).map(h => ({
+        range: rng(h),
+        kind: monaco.languages.DocumentHighlightKind.Text,
+      }));
+    },
+  });
+
+  // textDocument/foldingRange
+  monaco.languages.registerFoldingRangeProvider('idsl', {
+    provideFoldingRanges: function () {
+      if (!prog) return [];
+      return Array.from(prog.folding_ranges()).map(r => ({
+        start: r.start + 1,
+        end:   r.end   + 1,
+        kind:  monaco.languages.FoldingRangeKind.Region,
+      }));
+    },
+  });
+
+  // textDocument/selectionRange
+  monaco.languages.registerSelectionRangeProvider('idsl', {
+    provideSelectionRanges: function (model, positions) {
+      if (!prog) return positions.map(() => null);
+      return positions.map(p => {
+        const chain = prog.selection_ranges_at(p.lineNumber - 1,
+                                               p.column - 1);
+        // Monaco wants innermost-first list of {range}
+        const rev = Array.from(chain).reverse();
+        return rev.map(r => ({ range: rng(r) }));
+      });
+    },
+  });
+
+  // textDocument/signatureHelp
+  monaco.languages.registerSignatureHelpProvider('idsl', {
+    signatureHelpTriggerCharacters: ['(', ','],
+    signatureHelpRetriggerCharacters: [','],
+    provideSignatureHelp: function (model, position) {
+      if (!prog) return null;
+      const sh = prog.signature_help_at(position.lineNumber - 1,
+                                        position.column - 1);
+      if (!sh) return null;
+      return {
+        value: {
+          signatures: Array.from(sh.signatures).map(s => ({
+            label: s.label,
+            parameters: Array.from(s.parameters).map(p => ({
+              label: [p.label[0], p.label[1]],
+            })),
+          })),
+          activeSignature: sh.activeSignature,
+          activeParameter: sh.activeParameter,
+        },
+        dispose: () => {},
+      };
+    },
+  });
+
+  // textDocument/inlayHint
+  monaco.languages.registerInlayHintsProvider('idsl', {
+    provideInlayHints: function (model, range) {
+      if (!prog) return { hints: [], dispose: () => {} };
+      const hints = prog.inlay_hints_in(range.startLineNumber - 1,
+                                        range.endLineNumber - 1);
+      return {
+        hints: Array.from(hints).map(h => ({
+          position: { lineNumber: h.position.line + 1,
+                      column:     h.position.character + 1 },
+          label: h.label,
+          kind:  h.kind,                              // 1=Type, 2=Parameter
+          paddingLeft:  false,
+          paddingRight: !!h.paddingRight,
+        })),
+        dispose: () => {},
+      };
+    },
+  });
+
+  // textDocument/codeLens
+  monaco.languages.registerCodeLensProvider('idsl', {
+    provideCodeLenses: function (model) {
+      if (!prog) return { lenses: [], dispose: () => {} };
+      const lenses = prog.code_lenses();
+      return {
+        lenses: Array.from(lenses).map((l, i) => ({
+          id: 'lens-' + i,
+          range: rng(l.range),
+          command: {
+            id: 'editor.action.showReferences',
+            title: l.title,
+            arguments: [
+              model.uri,
+              { lineNumber: l.target.line + 1,
+                column:     l.target.character + 1 },
+              [],   // references list — Monaco recomputes via the provider
+            ],
+          },
+        })),
+        dispose: () => {},
+      };
+    },
+    resolveCodeLens: (model, codeLens) => codeLens,
+  });
+
+  // textDocument/typeDefinition (Round 7)
+  monaco.languages.registerTypeDefinitionProvider('idsl', {
+    provideTypeDefinition: function (model, position) {
+      if (!prog) return null;
+      const d = prog.type_definition_at(position.lineNumber - 1,
+                                        position.column - 1);
+      if (!d) return null;
+      return {
+        uri: model.uri,
+        range: new monaco.Range(
+          d.line + 1, d.character + 1,
+          d.line + 1, d.character + 1 + d.label.length
+        ),
+      };
+    },
+  });
+
+  // declaration / implementation reuse Definition under the hood;
+  // Monaco provides them via dedicated providers though, so wire them
+  // up so VS Code's `Go to Declaration` and `Go to Implementation`
+  // commands fire.
+  monaco.languages.registerDeclarationProvider('idsl', {
+    provideDeclaration: function (model, position) {
+      if (!prog) return null;
+      const d = prog.def_at(model.getValue(),
+                            position.lineNumber - 1,
+                            position.column - 1);
+      if (!d) return null;
+      return { uri: model.uri,
+               range: new monaco.Range(d.line + 1, d.character + 1,
+                                       d.line + 1, d.character + 2) };
+    },
+  });
+  monaco.languages.registerImplementationProvider('idsl', {
+    provideImplementation: function (model, position) {
+      if (!prog) return null;
+      const d = prog.def_at(model.getValue(),
+                            position.lineNumber - 1,
+                            position.column - 1);
+      if (!d) return null;
+      return { uri: model.uri,
+               range: new monaco.Range(d.line + 1, d.character + 1,
+                                       d.line + 1, d.character + 2) };
+    },
+  });
+
+  // textDocument/prepareRename + textDocument/rename
+  monaco.languages.registerRenameProvider('idsl', {
+    resolveRenameLocation: function (model, position) {
+      if (!prog) return { rejectReason: 'Compile failed' };
+      const r = prog.prepare_rename(position.lineNumber - 1,
+                                    position.column - 1);
+      if (!r) return { rejectReason: 'Not a renameable symbol' };
+      return { range: rng(r.range), text: r.placeholder.replace(/^\w+\s+/, '') };
+    },
+    provideRenameEdits: function (model, position, newName) {
+      if (!prog) return null;
+      const edits = prog.rename_at(position.lineNumber - 1,
+                                   position.column - 1, newName);
+      const arr = Array.from(edits);
+      if (arr.length === 0) return null;
+      return {
+        edits: arr.map(e => ({
+          resource: model.uri,
+          versionId: model.getVersionId(),
+          textEdit: { range: rng(e.range), text: e.newText },
+        })),
+      };
+    },
+  });
+
+  // textDocument/codeAction
+  monaco.languages.registerCodeActionProvider('idsl', {
+    provideCodeActions: function (model, _range, context) {
+      if (!prog) return { actions: [], dispose: () => {} };
+      const out = [];
+      // Each marker becomes a candidate diagnostic; pattern-match its
+      // message via the OCaml side and look up the bad identifier on
+      // the actual line text.
+      for (const d of context.markers) {
+        const msg = d.message;
+        const fixes = prog.quick_fixes_for(d.startLineNumber - 1,
+                                           d.startColumn - 1, msg);
+        for (const f of Array.from(fixes)) {
+          const lineText = model.getLineContent(d.startLineNumber);
+          // Search from the diagnostic column onward, falling back to
+          // anywhere on the line.
+          let col0 = lineText.indexOf(f.find, d.startColumn - 1);
+          if (col0 < 0) col0 = lineText.indexOf(f.find);
+          if (col0 < 0) continue;
+          const range = new monaco.Range(
+            d.startLineNumber, col0 + 1,
+            d.startLineNumber, col0 + 1 + f.find.length);
+          out.push({
+            title: f.title,
+            kind: 'quickfix',
+            isPreferred: true,
+            edit: {
+              edits: [{
+                resource: model.uri,
+                versionId: model.getVersionId(),
+                textEdit: { range, text: f.replace },
+              }],
+            },
+            diagnostics: [d],
+          });
+        }
+      }
+      return { actions: out, dispose: () => {} };
+    },
+  });
+
+  // textDocument/formatting — full-document normalize via OCaml CST renderer
+  monaco.languages.registerDocumentFormattingEditProvider('idsl', {
+    provideDocumentFormattingEdits: function (model) {
+      if (!prog) return [];
+      const newText = prog.format_full();
+      const cur = model.getValue();
+      if (newText === cur) return [];
+      const fullRange = model.getFullModelRange();
+      return [{ range: fullRange, text: newText }];
+    },
+  });
+
+  // textDocument/rangeFormatting — same normalizer applied to a slice
+  monaco.languages.registerDocumentRangeFormattingEditProvider('idsl', {
+    provideDocumentRangeFormattingEdits: function (model, range) {
+      if (!prog) return [];
+      const r = prog.format_range(model.getValue(),
+                                  range.startLineNumber - 1,
+                                  range.endLineNumber   - 1);
+      return [{ range: rng(r.range), text: r.text }];
+    },
+  });
+
+  // textDocument/onTypeFormatting — auto-indent after `:` newline
+  monaco.languages.registerOnTypeFormattingEditProvider('idsl', {
+    autoFormatTriggerCharacters: ['\n'],
+    provideOnTypeFormattingEdits: function (model, position, ch) {
+      if (!prog) return [];
+      const edits = prog.on_type_format(model.getValue(),
+                                        position.lineNumber - 1, ch);
+      return Array.from(edits).map(e => ({
+        range: rng(e.range),
+        text:  e.newText,
+      }));
+    },
+  });
+
+  // textDocument/semanticTokens — replaces the regex Monarch highlighter
+  // with index-driven coloring. Legend must be queried once at registration.
+  (function registerSemanticTokens() {
+    if (!IDSL || !IDSL.compile) return;
+    // We need a probe compile to learn the legend. Use a tiny dummy program.
+    const probe = IDSL.compile('@version("0.0.1")\n');
+    if (!probe || !probe.ok || !probe.program) return;
+    const legend = {
+      tokenTypes:     Array.from(probe.program.semantic_tokens().tokenTypes),
+      tokenModifiers: [],
+    };
+    monaco.languages.registerDocumentSemanticTokensProvider('idsl', {
+      getLegend: () => legend,
+      provideDocumentSemanticTokens: function () {
+        if (!prog) return null;
+        const r = prog.semantic_tokens();
+        const data = new Uint32Array(Array.from(r.data));
+        return { data, resultId: null };
+      },
+      releaseDocumentSemanticTokens: () => {},
+    });
+  })();
+
+  editor = monaco.editor.create($('editor'), {
+    value: DEFAULT_SRC,
+    language: 'idsl',
+    automaticLayout: true,
+    minimap: { enabled: false },
+    fontSize: 13,
+    lineNumbers: 'on',
+    scrollBeyondLastLine: false,
+    renderWhitespace: 'none',
+    'semanticHighlighting.enabled': true,
+    inlayHints: { enabled: 'on' },
+    codeLens: true,
+    folding: true,
+    foldingStrategy: 'auto',
+    occurrencesHighlight: 'singleFile',
+  });
+
+  // Debounced recompile on every change
+  let timer = null;
+  editor.onDidChangeModelContent(() => {
+    clearTimeout(timer);
+    timer = setTimeout(() => recompile(monaco), 200);
+  });
+
+  recompile(monaco);
+});
+
+// ---------- buttons ----------
+
+$('btnRun').onclick = () => {
+  if (!prog) return setStatus('compile errors above', false);
+  const [input, err] = parseInputOrError('input');
+  if (err) return setStatus('input JSON invalid: ' + err, false);
+  const r = prog.run($('schema').value, input);
+  if (!r.ok) { setStatus('run failed', false); return out(r.errors.join('\n')); }
+  setStatus(`${r.outcomes.length} outcome(s)`, true);
+  out(r.outcomes);
+};
+
+$('btnExplain').onclick = () => {
+  if (!prog) return setStatus('compile errors above', false);
+  const [input, err] = parseInputOrError('input');
+  if (err) return setStatus('input JSON invalid: ' + err, false);
+  const trace = prog.explain($('schema').value, input);
+  if (trace && trace.ok === false) { setStatus('explain failed', false); return out(trace.errors.join('\n')); }
+  setStatus(`${trace.length} rule(s) traced`, true);
+  outHtml(renderExplain(trace));
+};
+
+$('btnTest').onclick = () => {
+  if (!prog) return setStatus('compile errors above', false);
+  const results = prog.runTests();
+  const passed = results.filter(r => r.passed).length;
+  setStatus(`${passed}/${results.length} passed`, passed === results.length);
+  outHtml(renderTests(results));
+};
+
+$('btnDiff').onclick = () => {
+  if (!prog) return setStatus('compile errors above', false);
+  const [b, eb] = parseInputOrError('before');
+  if (eb) return setStatus('before JSON invalid: ' + eb, false);
+  const [a, ea] = parseInputOrError('input');
+  if (ea) return setStatus('after (input) JSON invalid: ' + ea, false);
+  const d = prog.diff($('schema').value, b, a);
+  if (d && d.ok === false) { setStatus('diff failed', false); return out(d.errors.join('\n')); }
+  setStatus(`${d.fields.length} field change(s), ${d.rules.length} rule change(s)`, true);
+  outHtml(renderDiff(d));
+};
+
+// ---------- renderers (unchanged from previous version) ----------
+
+function fmtValue(v) {
+  if (v === null || v === undefined) return '<span class="empty">missing</span>';
+  if (typeof v === 'string') return escapeHtml(JSON.stringify(v));
+  if (typeof v === 'object') return escapeHtml(JSON.stringify(v));
+  return escapeHtml(String(v));
+}
+
+function renderExplain(traces) {
+  const fired = traces.filter(t => t.fired);
+  const skipped = traces.filter(t => !t.fired);
+  const renderTrace = t => {
+    const preds = t.when.map(p => {
+      const mark = (p.value === true) ? '✓' : '✗';
+      const cls  = (p.value === true) ? 'ok' : 'err';
+      const binds = p.bindings.map(b => {
+        if (b.kind === 'derived') {
+          return `<div class="bind">• <b>${escapeHtml(b.name)}</b> = <span class="formula">${escapeHtml(b.formula)}</span> → ${fmtValue(b.value)}</div>`;
+        }
+        return `<div class="bind">• <b>${escapeHtml(b.name)}</b> = ${fmtValue(b.value)}</div>`;
+      }).join('');
+      return `<div class="pred"><span class="mark ${cls}">${mark}</span> ${escapeHtml(p.text)}</div>${binds}`;
+    }).join('');
+    const acts = t.outcomes.map(o =>
+      `<div class="bind">→ <code>${escapeHtml(o.call)}(${o.args.map(fmtValue).join(', ')})</code></div>`).join('');
+    return `<div class="rule">
+      <div class="rule-head">
+        <span class="pill ${t.fired ? 'fired' : 'skipped'}">${t.fired ? 'FIRED' : 'skipped'}</span>
+        <code>${escapeHtml(t.rule)}</code> on ${escapeHtml(t.schema)}
+      </div>
+      <div><i>when:</i></div>${preds}
+      ${t.fired && t.outcomes.length ? `<div style="margin-top:.4em"><i>produced:</i></div>${acts}` : ''}
+    </div>`;
+  };
+  return `<h3>FIRED (${fired.length})</h3>${fired.map(renderTrace).join('') || '<div class="empty">(none)</div>'}
+          <h3>DID NOT FIRE (${skipped.length})</h3>${skipped.map(renderTrace).join('') || '<div class="empty">(none)</div>'}`;
+}
+
+function renderTests(rs) {
+  return rs.map(r => `<div class="rule">
+    <div class="rule-head">
+      <span class="pill ${r.passed ? 'fired' : 'skipped'}" style="${r.passed ? '' : 'background:#c63232'}">
+        ${r.passed ? 'PASS' : 'FAIL'}
+      </span>
+      ${escapeHtml(r.name)}
+    </div>
+    ${r.failures.length ? r.failures.map(f => `<div class="bind err">${escapeHtml(f)}</div>`).join('') : ''}
+    ${r.fired.length ? `<div class="bind">fired rules: ${r.fired.map(escapeHtml).join(', ')}</div>` : ''}
+  </div>`).join('');
+}
+
+function renderDiff(d) {
+  const fields = d.fields.length === 0 ? '<div class="empty">(no field changes)</div>'
+    : d.fields.map(f => `<div class="bind"><b>${escapeHtml(f.name)}</b>: ${fmtValue(f.before)} → ${fmtValue(f.after)}</div>`).join('');
+  const rules = d.rules.length === 0 ? '<div class="empty">(no rule status changes)</div>'
+    : d.rules.map(r => {
+        const transition = `${r.firedBefore ? 'FIRED' : 'skipped'} → ${r.firedAfter ? 'FIRED' : 'skipped'}`;
+        const preds = r.predChanges.map(p =>
+          `<div class="bind">• ${escapeHtml(p.text)} (${fmtValue(p.before)} → ${fmtValue(p.after)})</div>`).join('');
+        return `<div class="rule">
+          <div class="rule-head"><code>${escapeHtml(r.rule)}</code>: ${transition}</div>
+          ${preds}
+        </div>`;
+      }).join('');
+  const outs = section => {
+    if (d.outcomes[section].length === 0) return '<div class="empty">(none)</div>';
+    return d.outcomes[section].map(o =>
+      `<div class="bind ${section === 'added' ? 'added' : 'removed'}">
+        ${section === 'added' ? '+' : '−'} <code>${escapeHtml(o.call)}(${o.args.map(fmtValue).join(', ')})</code>
+      </div>`).join('');
+  };
+  return `<h3>Fields</h3>${fields}
+          <h3>Rule status</h3>${rules}
+          <h3>Outcomes removed</h3>${outs('removed')}
+          <h3>Outcomes added</h3>${outs('added')}`;
+}
+</script>
+
+</body>
+</html>

@@ -1,0 +1,12 @@
+(test
+ (name test_iDSL)
+ (libraries iDSL str)
+ (deps (glob_files ../examples/*.idsl)))
+
+(test
+ (name test_workspace)
+ (libraries iDSL unix))
+
+(executable
+ (name recov_test)
+ (libraries iDSL))

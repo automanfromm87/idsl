@@ -1,0 +1,14 @@
+; All .ml files in subdirectories belong to a single namespace `IDSL`.
+; Folder structure is for human organization (syntax / ir / sem /
+; runtime / lsp); dune still resolves compilation order from deps.
+
+(include_subdirs unqualified)
+
+(library
+ (name iDSL)
+ (libraries str))
+
+(ocamllex lexer)
+
+(menhir
+ (modules parser))

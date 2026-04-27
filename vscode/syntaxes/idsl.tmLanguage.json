@@ -1,0 +1,56 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "iDSL",
+  "scopeName": "source.idsl",
+  "patterns": [
+    { "include": "#comments"  },
+    { "include": "#tstring"   },
+    { "include": "#strings"   },
+    { "include": "#money"     },
+    { "include": "#date"      },
+    { "include": "#number"    },
+    { "include": "#metadata"  },
+    { "include": "#keywords"  },
+    { "include": "#operators" },
+    { "include": "#identifier"}
+  ],
+  "repository": {
+    "comments":  { "match": "#.*$", "name": "comment.line.number-sign.idsl" },
+    "tstring":   {
+      "begin": "\"\"\"", "end": "\"\"\"",
+      "name": "string.quoted.triple.idsl"
+    },
+    "strings":   {
+      "begin": "\"", "end": "\"",
+      "name": "string.quoted.double.idsl"
+    },
+    "money":     {
+      "match": "\\$[0-9][0-9,]*(\\.[0-9]+)?",
+      "name": "constant.numeric.money.idsl"
+    },
+    "date":      {
+      "match": "\\b[0-9]{4}-[0-9]{2}-[0-9]{2}\\b",
+      "name": "constant.numeric.date.idsl"
+    },
+    "number":    {
+      "match": "\\b[0-9]+(\\.[0-9]+)?\\b",
+      "name": "constant.numeric.idsl"
+    },
+    "metadata":  {
+      "match": "@[A-Za-z_][A-Za-z0-9_]*",
+      "name": "entity.name.tag.idsl"
+    },
+    "keywords":  {
+      "match": "\\b(schema|rule|test|instance|action|include|when|then|given|expect|on|priority|if|then|else|and|or|not|any|every|count|sum|of|in|where|is|missing|present|true|false|min|max|for|e\\.g\\.|i\\.e\\.)\\b",
+      "name": "keyword.control.idsl"
+    },
+    "operators": {
+      "match": "==|!=|<=|>=|<|>|\\+|-|\\*|/|=",
+      "name": "keyword.operator.idsl"
+    },
+    "identifier": {
+      "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b",
+      "name": "variable.idsl"
+    }
+  }
+}

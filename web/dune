@@ -1,0 +1,11 @@
+(executable
+ (name idsl_js)
+ (libraries iDSL js_of_ocaml)
+ (preprocess (pps js_of_ocaml-ppx))
+ (modes js)
+ (js_of_ocaml (flags --opt 3))
+ (promote (until-clean)))
+
+(alias
+ (name web)
+ (deps idsl_js.bc.js))

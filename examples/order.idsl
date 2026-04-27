@@ -1,0 +1,192 @@
+# iDSL example — order fulfilment / shipping rules.
+# Multi-line expressions are supported when wrapped in parens.
+
+@version("0.0.1")
+@status("Active")
+
+# ── action signatures ──────────────────────────────────────────────────
+# When declared, every call is arity- and type-checked at compile time.
+
+@action flag(severity: {info|warn|alert}, reason: String)
+@action route(channel: {ground|air|express|freight})
+@action notify(team: String)
+
+# ── reusable schemas ───────────────────────────────────────────────────
+
+schema Item:
+  - SKU:    e.g. "WIDGET-A"
+  - Weight: e.g. 1.5                 # kg
+  - Value:  e.g. $50
+
+schema Carrier:
+  - Name:    e.g. "ACME Logistics"
+  - Express: e.g. true
+
+# Named instances: reusable fixtures.
+# Reference them by bare name: `Carriers = [UPS, USPS]`,
+# or with `{"$ref": "UPS"}` in a JSON input.
+instance Carrier UPS:
+  Name    = "UPS"
+  Express = true
+
+instance Carrier USPS:
+  Name    = "USPS"
+  Express = false
+
+# ── the order under review ─────────────────────────────────────────────
+
+schema Order:
+  - ID:             e.g. "ORD-1001"
+  - Tier:           e.g. Standard, Priority, Express
+  - OriginCountry:  e.g. "US"
+  - DestCountry:    e.g. "JP"
+  - PlacedDate:     e.g. 2025-01-15
+  - DueDate:        e.g. 2025-01-25
+  - Insured:        e.g. true
+  - Items:          e.g. [Item]
+  - Carriers:       e.g. [Carrier]            # list of Carrier instance refs
+
+  # Derived fields — formulas, not user input. Evaluated lazily in DAG order.
+  - TotalWeight: i.e. sum of x.Weight for x in Items where true
+  - TotalValue:  i.e. sum of x.Value  for x in Items where true
+  - LeadDays:    i.e. (DueDate - PlacedDate).days
+  - IsHeavy:     i.e. TotalWeight > 50
+  - IsHighValue: i.e. TotalValue  > $5,000
+  - IsExpedited: i.e. (Tier == Priority or Tier == Express)
+  - IsOverseas:  i.e. OriginCountry != DestCountry
+  - HasExpressCarrier: i.e. any c in Carriers: c.Express
+
+# ── rules ──────────────────────────────────────────────────────────────
+# Higher `priority` fires earlier; the default is 0.
+
+rule shipping.tier.express on Order priority 10:
+  """Express tier always wins over weight / region routing."""
+  when:
+    Tier == Express
+  then:
+    route(express)
+    flag(info, "express handling")
+
+rule shipping.weight.heavy on Order priority 5:
+  when:
+    IsHeavy
+  then:
+    route(freight)
+
+rule shipping.region.overseas on Order:
+  when:
+    IsOverseas
+  then:
+    route(air)
+    flag(warn, "overseas; check customs forms")
+
+rule shipping.value.uninsured on Order:
+  """High-value uninsured shipments are an unbounded loss exposure."""
+  when:
+    IsHighValue
+    not Insured
+  then:
+    flag(alert, "high-value uninsured")
+    notify("ops")
+
+rule shipping.deadline.tight on Order:
+  when:
+    LeadDays < 3
+  then:
+    flag(warn, "tight delivery window")
+    notify("dispatch")
+
+# ── tests ──────────────────────────────────────────────────────────────
+
+test "express tier picks the express channel":
+  given Order:
+    Tier = Express
+    OriginCountry = "US"
+    DestCountry = "US"
+    Items = []
+    Carriers = []
+    PlacedDate = 2025-01-15
+    DueDate = 2025-01-25
+  expect:
+    route(express)
+    flag(info, "express handling")
+
+test "heavy multi-item order routes to freight":
+  given Order:
+    Tier = Standard
+    OriginCountry = "US"
+    DestCountry = "US"
+    Items = [
+      {SKU: "BOX-A", Weight: 30, Value: $100},
+      {SKU: "BOX-B", Weight: 40, Value: $200}
+    ]
+    Carriers = []
+    PlacedDate = 2025-01-15
+    DueDate = 2025-01-25
+  expect:
+    route(freight)
+
+test "high-value uninsured triggers alert":
+  given Order:
+    Tier = Standard
+    OriginCountry = "US"
+    DestCountry = "US"
+    Insured = false
+    Items = [{SKU: "GOLD", Weight: 1, Value: $10000}]
+    Carriers = []
+    PlacedDate = 2025-01-15
+    DueDate = 2025-01-25
+  expect:
+    flag(alert, "high-value uninsured")
+    notify("ops")
+
+test "insured high-value clears the alert":
+  given Order:
+    Tier = Standard
+    OriginCountry = "US"
+    DestCountry = "US"
+    Insured = true
+    Items = [{SKU: "GOLD", Weight: 1, Value: $10000}]
+    Carriers = []
+    PlacedDate = 2025-01-15
+    DueDate = 2025-01-25
+  expect:
+    not flag(alert, _)            # _ = wildcard
+
+test "overseas destination routes via air":
+  given Order:
+    Tier = Standard
+    OriginCountry = "US"
+    DestCountry = "JP"
+    Items = [{SKU: "X", Weight: 5, Value: $100}]
+    Carriers = []
+    PlacedDate = 2025-01-15
+    DueDate = 2025-01-25
+  expect:
+    route(air)
+    flag(warn, "overseas; check customs forms")
+
+test "tight delivery window flagged":
+  given Order:
+    Tier = Standard
+    OriginCountry = "US"
+    DestCountry = "US"
+    Items = []
+    Carriers = []
+    PlacedDate = 2025-01-15
+    DueDate = 2025-01-16
+  expect:
+    flag(warn, "tight delivery window")
+
+test "named-instance carriers pass through":
+  given Order:
+    Tier = Standard
+    OriginCountry = "US"
+    DestCountry = "US"
+    Insured = true
+    Items = [{SKU: "X", Weight: 2, Value: $50}]
+    Carriers = [UPS, USPS]
+    PlacedDate = 2025-01-15
+    DueDate = 2025-01-25
+  expect:
+    not flag(_, _)

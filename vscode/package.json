@@ -1,0 +1,38 @@
+{
+  "name": "vscode-idsl",
+  "displayName": "iDSL",
+  "description": "Syntax highlighting + LSP support for iDSL.",
+  "version": "0.1.0",
+  "publisher": "idsl",
+  "engines": { "vscode": "^1.70.0" },
+  "categories": ["Programming Languages"],
+  "main": "./client/extension.js",
+  "activationEvents": [ "onLanguage:idsl" ],
+  "contributes": {
+    "languages": [{
+      "id": "idsl",
+      "aliases": ["iDSL", "idsl"],
+      "extensions": [".idsl"],
+      "configuration": "./language-configuration.json"
+    }],
+    "grammars": [{
+      "language": "idsl",
+      "scopeName": "source.idsl",
+      "path": "./syntaxes/idsl.tmLanguage.json"
+    }],
+    "configuration": {
+      "type": "object",
+      "title": "iDSL",
+      "properties": {
+        "idsl.serverPath": {
+          "type": "string",
+          "default": "idsl-lsp",
+          "description": "Path to the idsl-lsp executable. Use the absolute path or rely on $PATH."
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  }
+}
