@@ -985,6 +985,86 @@ let test_drop_closed_doc_cache () =
     (List.mem "InMem" names4);
   teardown ()
 
+(* ---------- Test 22: didClose invalidates dependents -----------
+
+   Scenario: a.idsl is included by main.idsl and the user has both
+   open with unsaved edits in a.idsl. They close a.idsl. main.idsl's
+   compile cache reflects the *unsaved* a.idsl text and must be
+   evicted, otherwise hover/diagnostics on main keep returning answers
+   shaped by content the editor no longer has. *)
+let test_didclose_invalidates_dependents () =
+  setup_tmpdir ();
+  let path_a = write_file ~name:"a.idsl"
+    ~content:"schema OnDisk:\n  - K: e.g. 1\n" in
+  let path_main = write_file ~name:"main.idsl"
+    ~content:"include \"a.idsl\"\n\nschema Outer:\n  - I: e.g. [OnDisk]\n" in
+  let ws = Workspace.create () in
+  let a_uri    = "file://" ^ path_a in
+  let main_uri = "file://" ^ path_main in
+
+  (* Both open. a.idsl's in-memory content renames the schema. main's
+     compile resolves [InMem] against the in-memory a.idsl. *)
+  Workspace.put_doc ws ~uri:main_uri
+    ~content:"include \"a.idsl\"\n\nschema Outer:\n  - I: e.g. [InMem]\n"
+    ~version:1;
+  Workspace.put_doc ws ~uri:a_uri
+    ~content:"schema InMem:\n  - K: e.g. 1\n" ~version:1;
+  let s_pre = Workspace.compile_doc ws ~uri:main_uri in
+  check "[close] main compiles cleanly against in-memory a.idsl"
+    (s_pre.diagnostics = []);
+
+  (* didClose on a.idsl: the bin first walks dependents (drops main's
+     cache), then removes a.idsl. *)
+  let affected = Workspace.invalidate ws ~uri:a_uri in
+  Workspace.remove_doc ws ~uri:a_uri;
+  check "[close] invalidate surfaced main as a dependent"
+    (List.mem main_uri affected);
+
+  (* main re-compiles against the on-disk a.idsl (which has `OnDisk`,
+     not `InMem`) — should now error because main's text references
+     [InMem]. *)
+  let s_post = Workspace.compile_doc ws ~uri:main_uri in
+  check "[close] main re-compiled against disk and now sees the gap"
+    (s_post.diagnostics <> []);
+  teardown ()
+
+(* ---------- Test 23: canonical URI keying --------------------------
+
+   `file:///x.idsl` and `file://localhost/x.idsl` denote the same
+   file; the workspace must collapse them so a putDoc under one form
+   is observable through the other. *)
+let test_canonical_uri_keying () =
+  setup_tmpdir ();
+  let path = write_file ~name:"shared.idsl"
+    ~content:"schema A:\n  - K: e.g. 1\n" in
+  let ws = Workspace.create () in
+  let plain     = "file://"          ^ path in
+  let localhost = "file://localhost" ^ path in
+  Workspace.put_doc ws ~uri:plain ~content:"schema A:\n" ~version:1;
+  check "[canon] put under file:/// is visible via file://localhost/"
+    (Workspace.get_doc ws ~uri:localhost <> None);
+
+  Workspace.put_doc ws ~uri:localhost
+    ~content:"schema B:\n" ~version:2;
+  let via_plain = match Workspace.get_doc ws ~uri:plain with
+    | Some d -> d.content | None -> "" in
+  check "[canon] update via localhost-form lands at the same identity"
+    (via_plain = "schema B:\n");
+
+  (* Compile under one form, hit cache under the other. *)
+  let _ = Workspace.compile_doc ws ~uri:plain in
+  Workspace.put_doc ws ~uri:plain
+    ~content:"schema C:\n" ~version:3;
+  let _ = Workspace.invalidate ws ~uri:localhost in
+  let s = Workspace.compile_doc ws ~uri:localhost in
+  let names =
+    match s.ast with
+    | Some prog -> List.map (fun s -> s.Ast.sname) (Ast.schemas prog)
+    | None -> [] in
+  check "[canon] invalidate via localhost drops the plain-form cache"
+    (List.mem "C" names);
+  teardown ()
+
 let () =
   Printf.printf "\n--- workspace regressions ---\n";
   test_multifile_include ();
@@ -1011,5 +1091,7 @@ let () =
   test_uri_encoding ();
   test_symlink_cycle ();
   test_drop_closed_doc_cache ();
+  test_didclose_invalidates_dependents ();
+  test_canonical_uri_keying ();
   Printf.printf "%d passed, %d failed\n" !pass !fail;
   if !fail > 0 then exit 1

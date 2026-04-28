@@ -1356,11 +1356,14 @@ let handle_type_hierarchy_subtypes =
    document diagnostic report" per LSP 3.17. Each call also surfaces
    unused-symbol hints from the index. *)
 
-let unused_diag_json (p, len, msg) : Json.t =
+let unused_diag_json ~fallback_uri (p, len, msg) : Json.t =
+  let host_uri =
+    Workspace.uri_of_pos_fname ~fallback:fallback_uri p.Lexing.pos_fname in
+  let src = source_for_uri host_uri in
   let lp = Lsp_query.pos_lsp_of_lex p in
   let end_p = { lp with character = lp.character + len } in
   Json.JObj [
-    "range",    range_json lp end_p;
+    "range",    utf16_range ~src lp end_p;
     "severity", Json.JNum 4.0;            (* Hint *)
     "source",   Json.JStr "idsl-lint";
     "message",  Json.JStr msg;
@@ -1383,7 +1386,9 @@ let handle_pull_diagnostics id params =
       List.map (fun d -> diagnostic_json ~src (Lsp_query.lsp_of_diag d))
         s.diagnostics in
     let unused = match Session.index s with
-      | Some idx -> List.map unused_diag_json (Lsp_query.unused_diagnostics idx)
+      | Some idx ->
+          List.map (unused_diag_json ~fallback_uri:uri)
+            (Lsp_query.unused_diagnostics idx)
       | None     -> [] in
     result id (Json.JObj [
       "kind",  Json.JStr "full";
@@ -1593,7 +1598,15 @@ let dispatch_message oc msg =
              let uri = match json_field params "textDocument" with
                | Some td -> (match json_field td "uri" with Some j -> json_str j | _ -> "")
                | _ -> "" in
-             Workspace.remove_doc ws ~uri
+             (* Walk dependents *first* so anything compiled against
+                this doc's unsaved buffer drops its cache; only then
+                remove the doc itself. Re-publish for every still-open
+                parent so they pick up the on-disk view. *)
+             let affected = Workspace.invalidate ws ~uri in
+             Workspace.remove_doc ws ~uri;
+             List.iter (fun u ->
+               if u <> uri && Workspace.get_doc ws ~uri:u <> None then
+                 analyze_and_publish oc u) affected
          | "textDocument/hover" ->
              write_message oc (handle_hover id params)
          | "textDocument/completion" ->

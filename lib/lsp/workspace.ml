@@ -147,6 +147,19 @@ let uri_of_path (p : string) : string =
   then "file://" ^ percent_encode_path p
   else p
 
+(* The single canonical form every public Workspace entry point sees.
+   Two equivalent file URIs (`file:///x`, `file://localhost/x`,
+   `file:///dir/../x`, `file:///x?q=1`) all collapse to the same key
+   here, so `docs` / `cache` / `deps` / `rdeps` can never end up with
+   two parallel entries for the same physical file. *)
+let canon_uri (uri : string) : string =
+  let scheme = "file://" in
+  let scheme_len = String.length scheme in
+  if String.length uri >= scheme_len
+     && String.sub uri 0 scheme_len = scheme
+  then uri_of_path (Driver.canon (path_of_uri uri))
+  else uri
+
 (* Map a `Lexing.position.pos_fname` into a `file://` URI, falling back
    to a caller-supplied URI when the position has no filename — most
    commonly: when the source came from a string buffer that wasn't
@@ -171,6 +184,7 @@ let read_file_opt (path : string) : string option =
 (* ---------- doc table ---------- *)
 
 let put_doc ws ~uri ~content ~version =
+  let uri = canon_uri uri in
   match Hashtbl.find_opt ws.docs uri with
   | Some d ->
       d.content <- content;
@@ -183,6 +197,7 @@ let put_doc ws ~uri ~content ~version =
    version so the caller can log and ignore. *)
 let put_doc_versioned ws ~uri ~content ~version
     : [`Updated | `Stale of int] =
+  let uri = canon_uri uri in
   match Hashtbl.find_opt ws.docs uri with
   | Some d when version < d.version -> `Stale d.version
   | Some d ->
@@ -194,16 +209,16 @@ let put_doc_versioned ws ~uri ~content ~version
       `Updated
 
 let remove_doc ws ~uri =
+  let uri = canon_uri uri in
   Hashtbl.remove ws.docs uri;
   Hashtbl.remove ws.cache uri;
   Hashtbl.remove ws.deps uri;
-  (* clean rdeps lists that pointed at us *)
   Hashtbl.iter (fun u xs ->
     let kept = List.filter (fun v -> v <> uri) xs in
     Hashtbl.replace ws.rdeps u kept) ws.rdeps;
   List.iter (fun cb -> cb ~uri) ws.on_remove
 
-let get_doc ws ~uri = Hashtbl.find_opt ws.docs uri
+let get_doc ws ~uri = Hashtbl.find_opt ws.docs (canon_uri uri)
 
 let all_uris ws = Hashtbl.fold (fun k _ acc -> k :: acc) ws.docs []
 
@@ -211,6 +226,8 @@ let all_uris ws = Hashtbl.fold (fun k _ acc -> k :: acc) ws.docs []
 
 (* Replace this doc's include set, updating reverse deps consistently. *)
 let set_deps ws ~uri ~includes =
+  let uri = canon_uri uri in
+  let includes = List.map canon_uri includes in
   let prev = try Hashtbl.find ws.deps uri with Not_found -> [] in
   Hashtbl.replace ws.deps uri includes;
   (* Remove this uri from old reverse-dep entries no longer relevant. *)
@@ -230,7 +247,7 @@ let set_deps ws ~uri ~includes =
     includes
 
 let dependents_of ws ~uri =
-  try Hashtbl.find ws.rdeps uri with Not_found -> []
+  try Hashtbl.find ws.rdeps (canon_uri uri) with Not_found -> []
 
 (* Drop compile-cache entries for every URI that isn't currently open
    in the editor. Open buffers are authoritative (every didChange
@@ -255,6 +272,7 @@ let drop_closed_doc_cache ws : unit =
    depending on it. Returns the set of URIs whose stored Session is now
    gone — handlers can use this list to push fresh diagnostics. *)
 let invalidate ws ~uri : string list =
+  let uri = canon_uri uri in
   let visited : (string, unit) Hashtbl.t = Hashtbl.create 8 in
   let rec walk u =
     if Hashtbl.mem visited u then []
@@ -285,6 +303,7 @@ let make_lookup ws : string -> string option =
   fun canon_path -> Hashtbl.find_opt by_path canon_path
 
 let compile_doc ws ~uri : Session.t =
+  let uri = canon_uri uri in
   match Hashtbl.find_opt ws.cache uri with
   | Some s -> s
   | None ->
@@ -410,6 +429,7 @@ type fs_change = Created | Changed | Deleted
    *before* `remove_doc` cleans up the rdeps edges, so open parents
    still get notified that their include just vanished. *)
 let handle_watched_change ws ~uri ~change : string list =
+  let uri = canon_uri uri in
   invalidate_folder_scan ws;
   let open_parents = List.filter (fun u -> Hashtbl.mem ws.docs u) in
   match change with
@@ -427,6 +447,7 @@ let handle_watched_change ws ~uri ~change : string list =
    in a.idsl would only surface b.idsl's refs and miss main.idsl's. *)
 let aggregated_references ws ~current_uri (sym : Symbol.t)
     : Semantic_index.ref_site list =
+  let current_uri = canon_uri current_uri in
   let dedup = Hashtbl.create 16 in
   let key (r : Semantic_index.ref_site) =
     (r.pos.pos_fname, r.pos.pos_lnum,
