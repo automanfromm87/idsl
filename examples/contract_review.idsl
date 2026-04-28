@@ -1,0 +1,245 @@
+# ────────────────────────────────────────────────────────────────────
+#  Contract review — first-pass legal triage
+#
+#  A new contract arrives.  This DSL decides:
+#    – does it need senior counsel sign-off?
+#    – are there compliance flags (jurisdiction, data residency)?
+#    – is the liability exposure unbounded?
+#    – is auto-renewal a long-term lock-in worth flagging?
+#
+#  The actions (`flag`, `require_signoff`, `route_to_team`) are
+#  black boxes — the rules engine just decides which ones fire.
+#  Whatever pipeline runs the rules wires those into Slack / Jira /
+#  the deal-room status board.
+# ────────────────────────────────────────────────────────────────────
+
+@version("0.0.3")
+@status("Active")
+
+# ────────────────────────────────────────────────────────────────────
+#  core: shared shapes everyone agrees on
+# ────────────────────────────────────────────────────────────────────
+
+domain core:
+  schema Counterparty:
+    - Name:         e.g. "Acme Corp"
+    - Jurisdiction: {US, EU, UK, JP, CN}
+    - IsRegulated:  Bool e.g. false
+
+  # `LiabilityCap` deliberately has no sample — it's optional, and
+  # legal rules below treat its absence as "unbounded exposure".
+  schema Contract:
+    - ID:            e.g. "MSA-2025-001"
+    - Kind:          {MSA, NDA, DPA, SOW}
+    - Counterparty:  core.Counterparty e.g. core.AcmeUS
+    - Value:         Money e.g. $1
+    - LiabilityCap:  Money
+    - SignedDate:    Date e.g. 2025-01-01
+    - TermYears:     Int e.g. 1
+    - Renewal:       {Auto, Manual} e.g. Manual
+
+  # Reusable counterparty fixtures — tests reference them by
+  # `core.AcmeUS` style.
+  instance Counterparty AcmeUS:
+    Name = "Acme Corp"
+    Jurisdiction = US
+    IsRegulated = false
+
+  instance Counterparty BetaJP:
+    Name = "Beta Holdings"
+    Jurisdiction = JP
+    IsRegulated = true
+
+  instance Counterparty SinoCN:
+    Name = "Sino Logistics"
+    Jurisdiction = CN
+    IsRegulated = true
+
+# ────────────────────────────────────────────────────────────────────
+#  compliance: jurisdiction-driven obligations
+# ────────────────────────────────────────────────────────────────────
+
+domain compliance:
+  predicate is_high_risk_jurisdiction on { Jurisdiction: {US, EU, UK, JP, CN} }:
+    Jurisdiction == CN
+
+  predicate requires_data_residency on { Jurisdiction: {US, EU, UK, JP, CN} }:
+    Jurisdiction == EU or Jurisdiction == CN
+
+# ────────────────────────────────────────────────────────────────────
+#  legal: thresholds, sign-off routing, risk flags
+# ────────────────────────────────────────────────────────────────────
+
+domain legal:
+  @action flag(severity: {info, warn, alert}, reason: String)
+  @action require_signoff(role: String)
+  @action route_to_team(team: String)
+
+  # Deal-size predicates.  Same record shape so all three are usable
+  # against any schema with matching fields, not just Contract.
+  predicate is_high_value on { Value: Money }:
+    Value > $5,000,000
+
+  predicate is_uncapped on { LiabilityCap: Money }:
+    LiabilityCap is missing
+
+  predicate is_long_term on { TermYears: Int }:
+    TermYears >= 5
+
+  # ── primary review rules ──
+
+  rule legal.review.high_value on core.Contract priority 10:
+    """High-dollar contracts need senior counsel before signature."""
+    when:
+      legal.is_high_value(self)
+    then:
+      legal.require_signoff("senior_counsel")
+      legal.flag(warn, "high-value contract")
+
+  # Three-valued logic in action: `LiabilityCap is missing` is the
+  # *explicit* probe.  Writing `not (LiabilityCap > $0)` would
+  # silently fail to fire on missing — `not missing` is `missing`,
+  # not `true`.
+  rule legal.review.uncapped on core.Contract priority 8:
+    """Liability cap absent on a non-trivial contract is unbounded
+    exposure — escalate."""
+    when:
+      Value > $100,000
+      legal.is_uncapped(self)
+    then:
+      legal.require_signoff("general_counsel")
+      legal.flag(alert, "uncapped liability")
+
+  rule legal.review.long_term_auto on core.Contract:
+    """Auto-renewing multi-year deals quietly extend exposure;
+    surface them so calendar reminders get set."""
+    when:
+      legal.is_long_term(self)
+      Renewal == Auto
+    then:
+      legal.flag(warn, "long-term auto-renewal — set reminder")
+
+  # Cross-domain predicate call.  `Counterparty` is a field of type
+  # core.Counterparty; passing it to compliance's predicate lets the
+  # check live with the regulators' rules instead of legal's.
+  rule legal.review.high_risk_jurisdiction on core.Contract:
+    when:
+      compliance.is_high_risk_jurisdiction(Counterparty)
+    then:
+      legal.require_signoff("regional_counsel")
+      legal.route_to_team("export_controls")
+
+  rule legal.review.data_residency on core.Contract:
+    when:
+      Kind == DPA
+      compliance.requires_data_residency(Counterparty)
+    then:
+      legal.flag(warn, "DPA: confirm in-region storage")
+
+  # ──────────────────────────────────────────────────────────────────
+  # tests
+  # ──────────────────────────────────────────────────────────────────
+
+  test "low-value capped contract triggers nothing":
+    given core.Contract:
+      Counterparty = core.AcmeUS
+      Value        = $1,000
+      LiabilityCap = $10,000
+      Kind         = MSA
+      TermYears    = 1
+      Renewal      = Manual
+    expect:
+      not legal.flag(_, _)
+      not legal.require_signoff(_)
+
+  # Table-driven: probe the value threshold with three points.
+  # Trailing commas keep the multi-field assigns readable across
+  # lines (commas are line-continuations).
+  test "value threshold behaviour" on core.Contract:
+    cases:
+      Counterparty = core.AcmeUS,
+      LiabilityCap = $1,000,000,
+      Kind = MSA,
+      TermYears = 1,
+      Renewal = Manual,
+      Value = $4,999,999 -> not legal.require_signoff("senior_counsel")
+
+      Counterparty = core.AcmeUS,
+      LiabilityCap = $1,000,000,
+      Kind = MSA,
+      TermYears = 1,
+      Renewal = Manual,
+      Value = $5,000,000 -> not legal.require_signoff("senior_counsel")
+
+      Counterparty = core.AcmeUS,
+      LiabilityCap = $1,000,000,
+      Kind = MSA,
+      TermYears = 1,
+      Renewal = Manual,
+      Value = $5,000,001 -> legal.require_signoff("senior_counsel")
+
+  test "uncapped at $200K triggers GC":
+    given core.Contract:
+      Counterparty = core.AcmeUS
+      Value        = $200,000
+      Kind         = MSA
+      TermYears    = 1
+      Renewal      = Manual
+    expect:
+      legal.require_signoff("general_counsel")
+      legal.flag(alert, "uncapped liability")
+
+  test "uncapped under threshold stays clean":
+    given core.Contract:
+      Counterparty = core.AcmeUS
+      Value        = $50,000
+      Kind         = MSA
+      TermYears    = 1
+      Renewal      = Manual
+    expect:
+      not legal.require_signoff("general_counsel")
+
+  test "high-risk jurisdiction routes to regional counsel":
+    given core.Contract:
+      Counterparty = core.SinoCN
+      Value        = $50,000
+      LiabilityCap = $100,000
+      Kind         = MSA
+      TermYears    = 1
+      Renewal      = Manual
+    expect:
+      legal.require_signoff("regional_counsel")
+      legal.route_to_team("export_controls")
+
+  test "long-term auto-renewal flagged":
+    given core.Contract:
+      Counterparty = core.AcmeUS
+      Value        = $50,000
+      LiabilityCap = $100,000
+      Kind         = MSA
+      TermYears    = 7
+      Renewal      = Auto
+    expect:
+      legal.flag(warn, "long-term auto-renewal — set reminder")
+
+  test "EU DPA flags data residency":
+    given core.Contract:
+      Counterparty = core.BetaJP   # JP doesn't trigger; placeholder
+      Value        = $1,000
+      LiabilityCap = $10,000
+      Kind         = DPA
+      TermYears    = 1
+      Renewal      = Manual
+    expect:
+      not legal.flag(warn, "DPA: confirm in-region storage")
+
+  test "Chinese DPA does flag data residency":
+    given core.Contract:
+      Counterparty = core.SinoCN
+      Value        = $1,000
+      LiabilityCap = $10,000
+      Kind         = DPA
+      TermYears    = 1
+      Renewal      = Manual
+    expect:
+      legal.flag(warn, "DPA: confirm in-region storage")

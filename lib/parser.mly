@@ -264,6 +264,10 @@ test_def:
     cb=cases_block
     { mk Cst.NTest $startpos $endpos
         ([g tk; g name; g on; g sch; g c] @ gs n0 @ [cb]) }
+  | tk=TEST name=STRING on=ON dom=IDENT dot=DOT sch=IDENT c=COLON n0=nls
+    cb=cases_block
+    { mk Cst.NTest $startpos $endpos
+        ([g tk; g name; g on; g dom; g dot; g sch; g c] @ gs n0 @ [cb]) }
 
 cases_block:
   | ck=CASES c=COLON n0=nls cs=list(test_case)
@@ -296,6 +300,10 @@ given_block:
   | gk=GIVEN sch=IDENT c=COLON n0=nls assigns=list(given_assign)
     { mk Cst.NGivenBlock $startpos $endpos
         ([g gk; g sch; g c] @ gs n0 @ assigns) }
+  | gk=GIVEN dom=IDENT dot=DOT sch=IDENT c=COLON n0=nls
+    assigns=list(given_assign)
+    { mk Cst.NGivenBlock $startpos $endpos
+        ([g gk; g dom; g dot; g sch; g c] @ gs n0 @ assigns) }
 
 given_assign:
   | name=IDENT eq=EQ value=expr nl=NEWLINE n0=nls

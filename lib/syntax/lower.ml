@@ -469,14 +469,20 @@ let lower_rule (n : node) : rule_def =
     rdomain      = None }
 
 let lower_given_block (n : node) : given_block =
+  let mk ~sch ~sch_text rest =
+    let assigns = List.filter_map (function
+      | GNode a when a.nkind = NGivenAssign -> Some (lower_given_assign a)
+      | _ -> None) rest in
+    { gschema     = sch_text;
+      gschema_pos = sch.Cst.start;
+      gvalues     = assigns }
+  in
   match significant n.nchildren with
-  | _gk :: GTok sch :: _c :: rest ->
-      let assigns = List.filter_map (function
-        | GNode a when a.nkind = NGivenAssign -> Some (lower_given_assign a)
-        | _ -> None) rest in
-      { gschema     = tok_text sch;
-        gschema_pos = sch.start;
-        gvalues     = assigns }
+  | _gk :: GTok dom :: GTok dot :: GTok sch :: _c :: rest
+    when dot.kind = Cst.Punct "." && is_ident_kind dom.kind ->
+      mk ~sch ~sch_text:(tok_text dom ^ "." ^ tok_text sch) rest
+  | _gk :: GTok sch :: _c :: rest when is_ident_kind sch.kind ->
+      mk ~sch ~sch_text:(tok_text sch) rest
   | _ -> err "given_block shape"
 
 let lower_expectation (n : node) : expectation =
@@ -538,17 +544,23 @@ let lower_test_one (n : node) : test_def list =
     | _ -> None) kids in
   match tname_tok, cases_block, g_block, e_block with
   | Some t, Some cb, _, _ ->
-      (* Table-driven form: `test "name" on Schema: cases: ...`.
-         The schema sits on the test header, just before the colon. *)
-      let on_sch = List.find_map (function
-        | GTok tk when is_ident_kind tk.kind -> Some tk
-        | _ -> None) (List.filter (function
-            | GTok tk -> (match tk.kind with
-                | Cst.Ident _ -> true | _ -> false)
-            | _ -> false) kids) in
-      let sch_tok = match on_sch with
-        | Some s -> s
-        | None -> err "table-driven test missing `on Schema:`" in
+      (* Table-driven form: `test "name" on [dom.]Schema: cases: ...`.
+         The schema sits on the test header.  Walk kids forward,
+         recognize either `ON IDENT` or `ON IDENT . IDENT`. *)
+      let rec find_on_schema = function
+        | [] -> err "table-driven test missing `on Schema:`"
+        | GTok tk :: rest when tk.kind = Cst.KW "on" ->
+            (match rest with
+             | GTok dom :: GTok dot :: GTok sch :: _
+               when dot.kind = Cst.Punct "." && is_ident_kind dom.kind
+                 && is_ident_kind sch.kind ->
+                 (sch, tok_text dom ^ "." ^ tok_text sch)
+             | GTok sch :: _ when is_ident_kind sch.kind ->
+                 (sch, tok_text sch)
+             | _ -> err "table-driven test malformed `on` clause")
+        | _ :: rest -> find_on_schema rest
+      in
+      let sch_tok, sch_name = find_on_schema kids in
       let cases_kids = significant cb.nchildren in
       let cases = List.filter_map (function
         | GNode c when c.nkind = NCase -> Some c
@@ -556,11 +568,11 @@ let lower_test_one (n : node) : test_def list =
       let base = tok_string_payload t in
       List.mapi (fun i case_node ->
         let assigns, expectation = lower_case case_node
-          ~gschema:(tok_text sch_tok)
+          ~gschema:sch_name
           ~gschema_pos:sch_tok.start in
         { tname   = Printf.sprintf "%s #%d" base (i + 1);
           tpos    = t.start;
-          tgiven  = { gschema     = tok_text sch_tok;
+          tgiven  = { gschema     = sch_name;
                       gschema_pos = sch_tok.start;
                       gvalues     = assigns };
           texpect = [expectation];

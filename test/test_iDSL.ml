@@ -463,8 +463,8 @@ schema Contract:
                                            and clause.Cap is missing)
 |};
 
-  assert_ok "example file"
-    (let ic = open_in "../examples/order.idsl" in
+  assert_tc_ok "example file: contract_review"
+    (let ic = open_in "../examples/contract_review.idsl" in
      let n = in_channel_length ic in
      let s = really_input_string ic n in
      close_in ic; s);

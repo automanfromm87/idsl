@@ -1,6 +1,0 @@
-# Shared schema for line items in any order.
-
-schema Item:
-  - SKU:    e.g. "WIDGET-A"
-  - Weight: e.g. 1.5     # kg
-  - Value:  e.g. $50

@@ -72,7 +72,10 @@ let alpha    = ['a'-'z' 'A'-'Z' '_']
 let alphanum = alpha | digit
 let ident    = alpha alphanum*
 let date     = digit digit digit digit '-' digit digit '-' digit digit
-let money    = '$' digit (digit | ',')* (frac)?
+(* `$1,000,000` — digits with thousands-separator commas. Each comma
+   must be followed by at least one digit, so a trailing `,` (e.g. in
+   a list of money literals) stays a separator and isn't eaten. *)
+let money    = '$' digit+ (',' digit+)* (frac)?
 let ws       = [' ' '\t' '\r']
 
 rule token = parse
