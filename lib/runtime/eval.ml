@@ -139,9 +139,12 @@ let num_op op a b =
          if is_money a || is_money b then VMoney r else VFloat r
      | _ -> err "non-numeric: %s %s" (show_value a) (show_value b))
 
+(* Three-valued comparison: any operand of `missing` propagates to
+   `missing`. Use `is missing` / `is present` to probe for it
+   explicitly without entering the three-valued world. *)
 let cmp_op op a b =
   match a, b with
-  | VMissing, _ | _, VMissing -> VBool false
+  | VMissing, _ | _, VMissing -> VMissing
   | VDate x, VDate y     -> VBool (op (compare x y) 0)
   | VString x, VString y -> VBool (op (compare x y) 0)
   | _ ->
@@ -236,7 +239,8 @@ let rec eval env (e : texpr) =
       (match eval env c with
        | VBool true  -> eval env t
        | VBool false -> eval env el
-       | VMissing    -> eval env el
+       | VMissing    -> VMissing       (* three-valued: missing
+                                          condition picks no branch *)
        | v -> err "if condition not bool: %s" (show_value v))
   | TAny (x, y, p) ->
       with_list env y (VBool false) (fun items ->
@@ -291,7 +295,7 @@ let rec eval env (e : texpr) =
 and eval_unop op v =
   match op, v with
   | Ast.Not, VBool b  -> VBool (not b)
-  | Ast.Not, VMissing -> VBool true
+  | Ast.Not, VMissing -> VMissing      (* three-valued *)
   | Ast.Not, _        -> err "not on non-bool: %s" (show_value v)
   | Ast.Neg, _ ->
       (match to_num v with
@@ -301,11 +305,28 @@ and eval_unop op v =
 and eval_binop op va vb =
   match op with
   | Ast.And ->
-      (match va, vb with VBool x, VBool y -> VBool (x && y) | _ -> VBool false)
+      (* Kleene three-valued AND. False short-circuits even when the
+         other side is missing (we know the conjunction is false). *)
+      (match va, vb with
+       | VBool false, _ | _, VBool false   -> VBool false
+       | VBool true,  VBool true           -> VBool true
+       | VMissing, _ | _, VMissing         -> VMissing
+       | _                                 -> VBool false)
   | Ast.Or ->
-      (match va, vb with VBool x, VBool y -> VBool (x || y) | _ -> VBool false)
-  | Ast.Eq  -> VBool (value_eq va vb)
-  | Ast.Neq -> VBool (not (value_eq va vb))
+      (* Kleene three-valued OR. True short-circuits dually. *)
+      (match va, vb with
+       | VBool true, _ | _, VBool true     -> VBool true
+       | VBool false, VBool false          -> VBool false
+       | VMissing, _ | _, VMissing         -> VMissing
+       | _                                 -> VBool false)
+  | Ast.Eq  ->
+      (match va, vb with
+       | VMissing, _ | _, VMissing -> VMissing
+       | _ -> VBool (value_eq va vb))
+  | Ast.Neq ->
+      (match va, vb with
+       | VMissing, _ | _, VMissing -> VMissing
+       | _ -> VBool (not (value_eq va vb)))
   | Ast.Lt  -> cmp_op (<)  va vb
   | Ast.Gt  -> cmp_op (>)  va vb
   | Ast.Leq -> cmp_op (<=) va vb

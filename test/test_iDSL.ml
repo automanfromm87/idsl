@@ -165,6 +165,82 @@ test "thresholds" on Order:
               Printf.printf "\n"; exit 1
             end));
 
+  (* Three-valued logic: a comparison whose operand is `missing`
+     yields `missing`, which propagates through `not` / `and` / `or`
+     / `if` / `==`. Rule when-blocks treat missing as false (rule
+     does not fire). *)
+  (let src = {|@action notify(team: String)
+
+schema Order:
+  - Cap: Money e.g. $1
+  - Required: Bool e.g. true
+
+rule no_cap_when_required on Order:
+  when:
+    Required
+    Cap is missing
+  then:
+    notify("ops")
+
+rule guarded_threshold on Order:
+  when:
+    Cap is missing or Cap > $1,000
+  then:
+    notify("review")
+
+rule naive_threshold on Order:
+  when:
+    not (Cap > $1,000)
+  then:
+    notify("safe")
+
+test "explicit missing probe fires":
+  given Order:
+    Required = true
+  expect:
+    notify("ops")
+
+test "guarded threshold fires on missing":
+  given Order:
+    Required = true
+  expect:
+    notify("review")
+
+test "naive threshold does NOT fire on missing (three-valued)":
+  given Order:
+    Required = true
+  expect:
+    not notify("safe")
+
+test "naive threshold fires when value is well-defined and small":
+  given Order:
+    Required = true
+    Cap = $500
+  expect:
+    notify("safe")
+|} in
+   match parse src with
+   | Error ds ->
+       Printf.printf "FAIL three-valued: parse %s\n" (pp_diags ds); exit 1
+   | Ok p ->
+       (match IDSL.Typecheck.run p with
+        | Error ds ->
+            Printf.printf "FAIL three-valued: tc %s\n" (pp_diags ds); exit 1
+        | Ok tp ->
+            let results, _ = IDSL.Eval.run_all tp in
+            if List.for_all (fun r -> r.IDSL.Eval.passed) results
+            then Printf.printf "ok   three-valued logic semantics\n"
+            else begin
+              Printf.printf "FAIL three-valued:\n";
+              List.iter (fun r ->
+                if not r.IDSL.Eval.passed then begin
+                  Printf.printf "       %s\n" r.IDSL.Eval.rname;
+                  List.iter (fun f ->
+                    Printf.printf "         %s\n" f) r.failures
+                end) results;
+              exit 1
+            end));
+
   (* End-to-end: predicate is callable from a derived field, runtime
      evaluates it against the schema's row, and the rule fires
      accordingly. *)
