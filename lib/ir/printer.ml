@@ -7,6 +7,7 @@ let pp_lit = function
   | LBool b   -> string_of_bool b
   | LMoney m  -> m
   | LDate d   -> d
+  | LRegex p  -> Printf.sprintf "r%S" p
 
 let pp_binop = function
   | And -> "and" | Or -> "or"
@@ -95,8 +96,13 @@ let pp_top = function
           Printf.sprintf "%s = %s" a.aname (pp_expr a.avalue)) tgiven.gvalues) in
       let expects = indent_lines "    "
         (List.map (function
-          | Must (_, e)    -> pp_expr e
-          | MustNot (_, e) -> "not " ^ pp_expr e) texpect) in
+          | Must (_, e)         -> pp_expr e
+          | MustNot (_, e)      -> "not " ^ pp_expr e
+          | Times (_, e, n)     -> Printf.sprintf "%s times %d" (pp_expr e) n
+          | AtLeast (_, e, n)   -> Printf.sprintf "%s at_least %d" (pp_expr e) n
+          | AtMost (_, e, n)    -> Printf.sprintf "%s at_most %d" (pp_expr e) n
+          | Before (_, a, b)    -> Printf.sprintf "%s before %s" (pp_expr a) (pp_expr b)
+          | After (_, a, b)     -> Printf.sprintf "%s after %s" (pp_expr a) (pp_expr b)) texpect) in
       Printf.sprintf "test %S:\n  given %s:\n%s\n  expect:\n%s"
         tname tgiven.gschema givens expects
   | TRule { rpath; rdesc; rwhen; rthen; rschema; rpriority; _ } ->

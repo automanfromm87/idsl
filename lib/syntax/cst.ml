@@ -11,6 +11,7 @@ type kind =
   | Punct    of string         (* `:` `,` `.` `@` `(` `)` `[` `]` `{` `}` `=` *)
   | Str      of string
   | TStr     of string         (* triple-quoted *)
+  | Regex    of string         (* `r"pattern"` for expect-side regex *)
   | Int      of int
   | Flt      of float
   | Money    of string
@@ -184,6 +185,7 @@ let pp_token_kind = function
   | Punct s     -> Printf.sprintf "Punct %S" s
   | Str _       -> "Str"
   | TStr _      -> "TStr"
+  | Regex _     -> "Regex"
   | Int _       -> "Int"
   | Flt _       -> "Flt"
   | Money _     -> "Money"

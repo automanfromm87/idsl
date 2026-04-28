@@ -31,7 +31,9 @@ let is_keyword = function
   | "true" | "false" | "min" | "max" | "for"
   | "test" | "given" | "expect" | "action" | "instance"
   | "on" | "priority" | "include" | "domain"
-  | "predicate" | "self" | "cases" | "default" -> true
+  | "predicate" | "self" | "cases" | "default"
+  | "times" | "at_least" | "at_most"
+  | "before" | "after" -> true
   | _ -> false
 
 (* tokens after which a newline is treated as continuation *)
@@ -98,6 +100,10 @@ rule token = parse
   | int as i                    { emit_log lexbuf (Int (int_of_string i)) (fun ct -> INT ct) }
   | "\"\"\""                    { tstring (Lexing.lexeme_start_p lexbuf)
                                           (Buffer.create 64) lexbuf }
+  (* Regex literal: `r"pattern"`. The `r` prefix avoids the `/.../`
+     ambiguity with division. Used in test expectations to match
+     stringly-typed action arguments. *)
+  | 'r' '"' ([^ '"']* as s) '"' { emit_log lexbuf (Regex s) (fun ct -> REGEX ct) }
   | '"' ([^ '"']* as s) '"'     { emit_log lexbuf (Str s) (fun ct -> STRING ct) }
   | '_'                         { emit_log lexbuf (Punct "_") (fun ct -> UNDERSCORE ct) }
   | ident as id                 {
@@ -140,6 +146,11 @@ rule token = parse
           | "self"     -> (fun ct -> SELF ct)
           | "cases"    -> (fun ct -> CASES ct)
           | "default"  -> (fun ct -> DEFAULT ct)
+          | "times"    -> (fun ct -> TIMES ct)
+          | "at_least" -> (fun ct -> AT_LEAST ct)
+          | "at_most"  -> (fun ct -> AT_MOST ct)
+          | "before"   -> (fun ct -> BEFORE ct)
+          | "after"    -> (fun ct -> AFTER ct)
           | _ -> assert false
         in
         emit_log lexbuf (KW id) parser_tok_ctor

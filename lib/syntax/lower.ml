@@ -199,13 +199,14 @@ and collect_kvs (kids : green list) : (ident * expr) list =
 
 and lower_literal (t : Cst.tok) : literal =
   match t.kind with
-  | Cst.Int i    -> LInt i
-  | Cst.Flt f    -> LFloat f
-  | Cst.Str s    -> LString s
+  | Cst.Int i      -> LInt i
+  | Cst.Flt f      -> LFloat f
+  | Cst.Str s      -> LString s
   | Cst.KW "true"  -> LBool true
   | Cst.KW "false" -> LBool false
-  | Cst.Money m  -> LMoney m
-  | Cst.Date d   -> LDate d
+  | Cst.Money m    -> LMoney m
+  | Cst.Date d     -> LDate d
+  | Cst.Regex p    -> LRegex p
   | _ -> err "unknown literal token %S" t.text
 
 (* ---------- field / schema lowering ---------- *)
@@ -504,15 +505,49 @@ let lower_given_block (n : node) : given_block =
 let lower_expectation (n : node) : expectation =
   let kids = significant n.nchildren in
   let pos = fst n.nspan in
+  let is_kw kw = function GTok t -> t.kind = Cst.KW kw | _ -> false in
   let starts_not = match kids with GTok t :: _ -> t.kind = Cst.KW "not" | _ -> false in
-  let expr_node = List.find_map (function
-    | GNode e when e.nkind = NExpr || e.nkind = NAtom || e.nkind = NLiteral ->
-        Some e
-    | _ -> None) kids in
-  let e = match expr_node with
-    | Some n -> lower_expr n
-    | None -> err "expectation has no expr" in
-  if starts_not then MustNot (pos, e) else Must (pos, e)
+  (* Strip a leading `not` so the rest can be analyzed uniformly. *)
+  let body = if starts_not then List.tl kids else kids in
+  let exprs = List.filter (function
+    | GNode e when e.nkind = NExpr || e.nkind = NAtom || e.nkind = NLiteral
+      -> true
+    | _ -> false) body in
+  let lower_exp = function GNode e -> lower_expr e | _ -> err "expectation expr" in
+  match starts_not, body with
+  | true, _ ->
+      (match exprs with
+       | [e] -> MustNot (pos, lower_exp e)
+       | _ -> err "`not` expectation must have one call")
+  | false, _ ->
+      (* Look for trailing modifier tokens. *)
+      let count_int () =
+        match List.rev kids with
+        | _nl :: GTok n :: _ when (match n.kind with Cst.Int _ -> true | _ -> false)
+          -> tok_int_payload n
+        | GTok n :: _ when (match n.kind with Cst.Int _ -> true | _ -> false)
+          -> tok_int_payload n
+        | _ -> err "count modifier requires an integer"
+      in
+      let has_kw kw = List.exists (is_kw kw) body in
+      if has_kw "times" then
+        Times (pos, lower_exp (List.hd exprs), count_int ())
+      else if has_kw "at_least" then
+        AtLeast (pos, lower_exp (List.hd exprs), count_int ())
+      else if has_kw "at_most" then
+        AtMost (pos, lower_exp (List.hd exprs), count_int ())
+      else if has_kw "before" then
+        (match exprs with
+         | [a; b] -> Before (pos, lower_exp a, lower_exp b)
+         | _ -> err "`before` needs two calls")
+      else if has_kw "after" then
+        (match exprs with
+         | [a; b] -> After (pos, lower_exp a, lower_exp b)
+         | _ -> err "`after` needs two calls")
+      else
+        (match exprs with
+         | [e] -> Must (pos, lower_exp e)
+         | _ -> err "expectation shape")
 
 let lower_expect_block (n : node) : expectation list =
   List.filter_map (function

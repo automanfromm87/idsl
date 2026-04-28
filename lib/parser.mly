@@ -12,7 +12,7 @@ let gs (ts : Cst.tok list) : Cst.green list = List.map g ts
 let opt = function Some x -> [x] | None -> []
 %}
 
-%token <Cst.tok> INT FLOAT STRING TSTRING IDENT DATE MONEY
+%token <Cst.tok> INT FLOAT STRING TSTRING IDENT DATE MONEY REGEX
 
 %token <Cst.tok> SCHEMA RULE WHEN THEN
 %token <Cst.tok> IF ELSE
@@ -25,6 +25,7 @@ let opt = function Some x -> [x] | None -> []
 %token <Cst.tok> TEST GIVEN EXPECT
 %token <Cst.tok> ACTION INSTANCE ON PRIORITY INCLUDE DOMAIN
 %token <Cst.tok> PREDICATE SELF CASES ARROW
+%token <Cst.tok> TIMES AT_LEAST AT_MOST BEFORE AFTER
 %token <Cst.tok> COLON COMMA LPAREN RPAREN LBRACKET RBRACKET LBRACE RBRACE
 %token <Cst.tok> DOT AT
 %token <Cst.tok> EQEQ NEQ LEQ GEQ LT GT EQ UNDERSCORE
@@ -227,6 +228,7 @@ literal:
   | f=FALSE  { mk Cst.NLiteral $startpos $endpos [g f] }
   | m=MONEY  { mk Cst.NLiteral $startpos $endpos [g m] }
   | d=DATE   { mk Cst.NLiteral $startpos $endpos [g d] }
+  | r=REGEX  { mk Cst.NLiteral $startpos $endpos [g r] }
 
 (* ---------- rule ---------- *)
 
@@ -305,6 +307,16 @@ case_assign:
 case_expectation:
   | nk=NOT e=expr
     { mk Cst.NExpectation $startpos $endpos [g nk; e] }
+  | e=expr op=TIMES n=INT
+    { mk Cst.NExpectation $startpos $endpos [e; g op; g n] }
+  | e=expr op=AT_LEAST n=INT
+    { mk Cst.NExpectation $startpos $endpos [e; g op; g n] }
+  | e=expr op=AT_MOST n=INT
+    { mk Cst.NExpectation $startpos $endpos [e; g op; g n] }
+  | a=expr op=BEFORE b=expr
+    { mk Cst.NExpectation $startpos $endpos [a; g op; b] }
+  | a=expr op=AFTER b=expr
+    { mk Cst.NExpectation $startpos $endpos [a; g op; b] }
   | e=expr
     { mk Cst.NExpectation $startpos $endpos [e] }
 
@@ -331,6 +343,21 @@ expectation:
   | nk=NOT e=expr nl=NEWLINE n0=nls
     { mk Cst.NExpectation $startpos $endpos
         ([g nk; e; g nl] @ gs n0) }
+  | e=expr op=TIMES n=INT nl=NEWLINE n0=nls
+    { mk Cst.NExpectation $startpos $endpos
+        ([e; g op; g n; g nl] @ gs n0) }
+  | e=expr op=AT_LEAST n=INT nl=NEWLINE n0=nls
+    { mk Cst.NExpectation $startpos $endpos
+        ([e; g op; g n; g nl] @ gs n0) }
+  | e=expr op=AT_MOST n=INT nl=NEWLINE n0=nls
+    { mk Cst.NExpectation $startpos $endpos
+        ([e; g op; g n; g nl] @ gs n0) }
+  | a=expr op=BEFORE b=expr nl=NEWLINE n0=nls
+    { mk Cst.NExpectation $startpos $endpos
+        ([a; g op; b; g nl] @ gs n0) }
+  | a=expr op=AFTER b=expr nl=NEWLINE n0=nls
+    { mk Cst.NExpectation $startpos $endpos
+        ([a; g op; b; g nl] @ gs n0) }
   | e=expr nl=NEWLINE n0=nls
     { mk Cst.NExpectation $startpos $endpos
         ([e; g nl] @ gs n0) }

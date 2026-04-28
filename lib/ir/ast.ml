@@ -13,8 +13,9 @@ type literal =
   | LFloat  of float
   | LString of string
   | LBool   of bool
-  | LMoney  of string  (* keep raw form, e.g. "$5,000,000" *)
+  | LMoney  of string  (* keep raw form, "$5,000,000" *)
   | LDate   of string  (* "YYYY-MM-DD" *)
+  | LRegex  of string  (* `r"pattern"`; only meaningful in expect: *)
 
 type ty =
   | TName of ident
@@ -118,9 +119,17 @@ type given_block = {
   gvalues     : field_assign list;
 }
 
+(* `Must` / `MustNot` give "called at least once" / "never called"
+   semantics.  The richer forms below are for tests that need to pin
+   down call counts or call ordering. *)
 type expectation =
-  | Must    of pos * expr
-  | MustNot of pos * expr
+  | Must     of pos * expr
+  | MustNot  of pos * expr
+  | Times    of pos * expr * int          (* exactly N occurrences *)
+  | AtLeast  of pos * expr * int          (* >= N occurrences *)
+  | AtMost   of pos * expr * int          (* <= N occurrences *)
+  | Before   of pos * expr * expr         (* a fired and a's index < b's *)
+  | After    of pos * expr * expr         (* a fired and a's index > b's *)
 
 type test_def = {
   tname    : string;

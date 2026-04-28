@@ -77,8 +77,13 @@ type tgiven = {
 }
 
 type texpectation =
-  | TMust    of tcall
-  | TMustNot of tcall
+  | TMust     of tcall
+  | TMustNot  of tcall
+  | TTimes    of tcall * int
+  | TAtLeast  of tcall * int
+  | TAtMost   of tcall * int
+  | TBefore   of tcall * tcall
+  | TAfter    of tcall * tcall
 
 type ttest = {
   tt_name   : string;          (* canonical: "domain.<bare test name>" *)
@@ -234,8 +239,13 @@ let pp_test t =
        t.tt_given.tg_values) in
   let expects = indent_lines "    "
     (List.map (function
-       | TMust c    -> pp_call c
-       | TMustNot c -> "not " ^ pp_call c) t.tt_expect) in
+       | TMust c          -> pp_call c
+       | TMustNot c       -> "not " ^ pp_call c
+       | TTimes (c, n)    -> Printf.sprintf "%s times %d" (pp_call c) n
+       | TAtLeast (c, n)  -> Printf.sprintf "%s at_least %d" (pp_call c) n
+       | TAtMost (c, n)   -> Printf.sprintf "%s at_most %d" (pp_call c) n
+       | TBefore (a, b)   -> Printf.sprintf "%s before %s" (pp_call a) (pp_call b)
+       | TAfter (a, b)    -> Printf.sprintf "%s after %s" (pp_call a) (pp_call b)) t.tt_expect) in
   Printf.sprintf "test %S on %s:\n  given:\n%s\n  expect:\n%s"
     t.tt_name t.tt_given.tg_schema givens expects
 

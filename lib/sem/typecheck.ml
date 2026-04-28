@@ -118,6 +118,7 @@ let infer_lit = function
   | LBool _   -> TBool
   | LMoney _  -> TMoney
   | LDate _   -> TDate
+  | LRegex _  -> TString  (* matches String-typed positions *)
 
 let resolve_var env id =
   match List.assoc_opt id env.vars with
@@ -616,15 +617,18 @@ let typecheck_test env t =
           with Type_error m ->
             err_at a.apos "test %S: %s = ...: %s" t.tname a.aname m
         in (a.aname, te)) t.tgiven.gvalues in
-  let expects = List.map (fun ex ->
-    let pos, e, ctor =
-      match ex with
-      | Must (p, e)    -> p, e, (fun c -> TMust c)
-      | MustNot (p, e) -> p, e, (fun c -> TMustNot c) in
-    let call =
-      try typecheck_call env_g e
-      with Type_error m -> err_at pos "test %S expect: %s" t.tname m
-    in ctor call) t.texpect
+  let tc_call pos e =
+    try typecheck_call env_g e
+    with Type_error m -> err_at pos "test %S expect: %s" t.tname m in
+  let expects = List.map (function
+    | Must     (p, e)    -> TMust    (tc_call p e)
+    | MustNot  (p, e)    -> TMustNot (tc_call p e)
+    | Times    (p, e, n) -> TTimes   (tc_call p e, n)
+    | AtLeast  (p, e, n) -> TAtLeast (tc_call p e, n)
+    | AtMost   (p, e, n) -> TAtMost  (tc_call p e, n)
+    | Before   (p, a, b) -> TBefore  (tc_call p a, tc_call p b)
+    | After    (p, a, b) -> TAfter   (tc_call p a, tc_call p b)
+    ) t.texpect
   in
   { tt_name = qualify t.tdomain t.tname;
     tt_bare = t.tname;

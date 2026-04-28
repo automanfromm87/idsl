@@ -17,6 +17,7 @@ let rec value_to_json (v : value) : Json.t =
       JObj (List.map (fun (k, v) -> (k, value_to_json v)) kvs)
   | VMissing    -> JNull
   | VWildcard   -> JNull
+  | VRegex p    -> JStr ("r" ^ p)
 
 let outcome_to_json (name, args) : Json.t =
   JObj [

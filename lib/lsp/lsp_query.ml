@@ -80,7 +80,13 @@ let hover_at (tp : tprogram) (cursor : lsp_pos) : string option =
   List.iter (fun (t : ttest) ->
     List.iter (fun (_, te) -> scan te) t.tt_given.tg_values;
     List.iter (function
-      | TMust (_, _, args) | TMustNot (_, _, args) -> List.iter scan args)
+      | TMust (_, _, args) | TMustNot (_, _, args)
+      | TTimes ((_, _, args), _)
+      | TAtLeast ((_, _, args), _)
+      | TAtMost ((_, _, args), _) -> List.iter scan args
+      | TBefore ((_, _, a1), (_, _, a2))
+      | TAfter ((_, _, a1), (_, _, a2)) ->
+          List.iter scan a1; List.iter scan a2)
       t.tt_expect) tp.tests;
   match List.rev !candidates with
   | []   -> None
@@ -531,7 +537,10 @@ let inlay_hints_in_range (tp : Typed.tprogram)
   List.iter (fun (t : Typed.ttest) ->
     List.iter (fun (_, te) -> walk_expr te) t.tt_given.tg_values;
     List.iter (function
-      | TMust c | TMustNot c -> walk_tcall c) t.tt_expect) tp.tests;
+      | TMust c | TMustNot c
+      | TTimes (c, _) | TAtLeast (c, _) | TAtMost (c, _) -> walk_tcall c
+      | TBefore (a, b) | TAfter (a, b) -> walk_tcall a; walk_tcall b)
+      t.tt_expect) tp.tests;
   List.rev !acc
 
 (* ---------- codeLens ----------
@@ -596,7 +605,7 @@ let enummember_type = 9
 let token_type_of_kind = function
   | Cst.KW _                                      -> Some kw_type
   | Cst.Bool _                                    -> Some kw_type
-  | Cst.Str _ | Cst.TStr _                        -> Some str_type
+  | Cst.Str _ | Cst.TStr _ | Cst.Regex _          -> Some str_type
   | Cst.Int _ | Cst.Flt _ | Cst.Money _ | Cst.Date _ -> Some num_type
   | Cst.Op _                                      -> Some op_type
   | Cst.Comment _                                 -> Some comment_type

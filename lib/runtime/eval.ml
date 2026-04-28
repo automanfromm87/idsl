@@ -15,6 +15,7 @@ type value =
   | VList   of value list
   | VObject of (string * value) list
   | VTag    of string
+  | VRegex  of string         (* pattern source; compiled on demand *)
   | VMissing
   | VWildcard
 
@@ -55,6 +56,7 @@ let rec show_value = function
               (List.map (fun (k, v) -> k ^ ": " ^ show_value v) kvs) ^ "}"
   | VMissing    -> "missing"
   | VWildcard   -> "_"
+  | VRegex p    -> Printf.sprintf "r%S" p
 
 let show_outcome (name, args) =
   Printf.sprintf "%s(%s)" name (String.concat ", " (List.map show_value args))
@@ -77,6 +79,7 @@ let lit_to_value = function
   | Ast.LBool b   -> VBool b
   | Ast.LMoney s  -> VMoney (parse_money s)
   | Ast.LDate s   -> VDate s
+  | Ast.LRegex p  -> VRegex p
 
 let to_num = function
   | VInt i      -> Some (float_of_int i)
@@ -174,6 +177,34 @@ let rec value_eq a b =
     (match to_num a, to_num b with
      | Some x, Some y -> x = y
      | _ -> false)
+
+(* Asymmetric matcher used by `expect:` blocks.  Differs from
+   `value_eq` in two ways:
+
+   1. **Object literals are partial.**  The expected side must contain
+      every field listed in the test; the actual side can have more.
+      Lets test data evolve (new fields added) without breaking older
+      tests that didn't mention them.
+   2. **Regex match strings.**  When expected is `VRegex` and actual
+      is `VString`, we run the pattern against the string. Used to
+      assert "any reason text containing 'high-value'" without
+      pinning the exact wording. *)
+let rec expect_match expected actual =
+  match expected, actual with
+  | VWildcard, _ | _, VWildcard -> true
+  | VRegex pat, VString s ->
+      (try
+         let _ = Str.search_forward (Str.regexp pat) s 0 in
+         true
+       with Not_found -> false)
+  | VObject xs, VObject ys ->
+      List.for_all (fun (k, v) ->
+        match List.assoc_opt k ys with
+        | Some w -> expect_match v w
+        | None   -> false) xs
+  | VList xs, VList ys when List.length xs = List.length ys ->
+      List.for_all2 expect_match xs ys
+  | _ -> value_eq expected actual
 
 (* ---------- env ---------- *)
 
@@ -430,17 +461,74 @@ let run_rules env (rules : trule list) =
 let outcome_matches env (call_name, expected_args) (name, args) =
   call_name = name
   && List.length expected_args = List.length args
-  && List.for_all2 (fun e a -> value_eq (eval env e) a) expected_args args
+  && List.for_all2 (fun e a -> expect_match (eval env e) a) expected_args args
+
+let count_matching env (n, args) outcomes =
+  List.length (List.filter (outcome_matches env (n, args)) outcomes)
+
+let first_match_index env (n, args) outcomes =
+  let rec loop i = function
+    | [] -> None
+    | o :: _ when outcome_matches env (n, args) o -> Some i
+    | _ :: rest -> loop (i + 1) rest
+  in
+  loop 0 outcomes
+
+let outcomes_summary outcomes =
+  match outcomes with
+  | [] -> "[]"
+  | _  -> Printf.sprintf "[%s]"
+            (String.concat "; " (List.map show_outcome outcomes))
 
 let check_expectation env outcomes = function
   | TMust (_p, n, args) ->
       if List.exists (outcome_matches env (n, args)) outcomes then None
-      else Some (Printf.sprintf "expected %s(...) to fire, got: [%s]"
-                   n (String.concat "; " (List.map show_outcome outcomes)))
+      else Some (Printf.sprintf "expected %s(...) to fire, got: %s"
+                   n (outcomes_summary outcomes))
   | TMustNot (_p, n, args) ->
       if List.exists (outcome_matches env (n, args)) outcomes then
         Some (Printf.sprintf "expected NOT %s(...), but a match fired" n)
       else None
+  | TTimes ((_p, n, args), expected) ->
+      let got = count_matching env (n, args) outcomes in
+      if got = expected then None
+      else Some (Printf.sprintf
+                   "expected %s(...) to fire exactly %d time(s), got %d"
+                   n expected got)
+  | TAtLeast ((_p, n, args), bound) ->
+      let got = count_matching env (n, args) outcomes in
+      if got >= bound then None
+      else Some (Printf.sprintf
+                   "expected %s(...) at least %d time(s), got %d"
+                   n bound got)
+  | TAtMost ((_p, n, args), bound) ->
+      let got = count_matching env (n, args) outcomes in
+      if got <= bound then None
+      else Some (Printf.sprintf
+                   "expected %s(...) at most %d time(s), got %d"
+                   n bound got)
+  | TBefore ((_pa, na, aa), (_pb, nb, ab)) ->
+      (match first_match_index env (na, aa) outcomes,
+             first_match_index env (nb, ab) outcomes with
+       | Some ia, Some ib when ia < ib -> None
+       | Some _, Some _ ->
+           Some (Printf.sprintf
+                   "expected %s(...) before %s(...), but it fired after" na nb)
+       | None, _ ->
+           Some (Printf.sprintf "expected %s(...) to fire (before-clause)" na)
+       | _, None ->
+           Some (Printf.sprintf "expected %s(...) to fire (before-clause)" nb))
+  | TAfter ((_pa, na, aa), (_pb, nb, ab)) ->
+      (match first_match_index env (na, aa) outcomes,
+             first_match_index env (nb, ab) outcomes with
+       | Some ia, Some ib when ia > ib -> None
+       | Some _, Some _ ->
+           Some (Printf.sprintf
+                   "expected %s(...) after %s(...), but it fired before" na nb)
+       | None, _ ->
+           Some (Printf.sprintf "expected %s(...) to fire (after-clause)" na)
+       | _, None ->
+           Some (Printf.sprintf "expected %s(...) to fire (after-clause)" nb))
 
 (* ---------- run ---------- *)
 
