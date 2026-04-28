@@ -175,11 +175,16 @@ let rec value_eq a b =
 (* ---------- env ---------- *)
 
 type env = {
-  bindings  : (ident * value) list;
-  instances : (ident, value) Hashtbl.t;
+  bindings   : (ident * value) list;
+  instances  : (ident, value) Hashtbl.t;
+  predicates : (ident, texpr) Hashtbl.t;
 }
 
-let empty_env = { bindings = []; instances = Hashtbl.create 0 }
+let empty_env = {
+  bindings   = [];
+  instances  = Hashtbl.create 0;
+  predicates = Hashtbl.create 0;
+}
 let bind env k v = { env with bindings = (k, v) :: env.bindings }
 let lookup env k = List.assoc_opt k env.bindings
 
@@ -263,8 +268,25 @@ let rec eval env (e : texpr) =
            let r = if name = "min" then min x y else max x y in
            if is_money va || is_money vb then VMoney r else VFloat r
        | _ -> err "%s: non-numeric" name)
+  | TCall (name, [arg]) when Hashtbl.mem env.predicates name ->
+      let body = Hashtbl.find env.predicates name in
+      let arg_v = eval env arg in
+      let kvs = match arg_v with
+        | VObject kvs -> kvs
+        | _ -> err "predicate %s: expected an object argument" name in
+      (* Bind every (field, value) in the arg as a local; predicate
+         body sees those plus the surrounding env's instances. *)
+      let pred_env = List.fold_left
+        (fun e (k, v) -> bind e k v) env kvs in
+      eval pred_env body
   | TCall (name, _) ->
       err "call %s only valid as rule action / expectation" name
+  | TSelf field_types ->
+      VObject (List.map (fun (k, _) ->
+        let v = match lookup env k with
+          | Some v -> v
+          | None   -> VMissing in
+        (k, v)) field_types)
 
 and eval_unop op v =
   match op, v with
@@ -319,23 +341,26 @@ and with_list env y on_missing on_list =
 (* ---------- per-program context ---------- *)
 
 type ctx = {
-  schemas   : (ident, tschema) Hashtbl.t;
-  instances : (ident, value) Hashtbl.t;
-  rules     : trule list;
+  schemas    : (ident, tschema) Hashtbl.t;
+  instances  : (ident, value) Hashtbl.t;
+  predicates : (ident, texpr) Hashtbl.t;
+  rules      : trule list;
 }
 
 let make_ctx (tp : tprogram) =
-  let schemas   = Hashtbl.create 16 in
-  let instances = Hashtbl.create 8 in
+  let schemas    = Hashtbl.create 16 in
+  let instances  = Hashtbl.create 8 in
+  let predicates = Hashtbl.create 8 in
   List.iter (fun s -> Hashtbl.replace schemas s.ts_name s) tp.schemas;
-  let env_with_inst = { empty_env with instances } in
+  List.iter (fun (p : tpredicate) ->
+    Hashtbl.replace predicates p.tp_name p.tp_body) tp.predicates;
+  let env_with_inst = { empty_env with instances; predicates } in
   List.iter (fun (i : tinstance) ->
     let kvs = List.map (fun (k, te) -> (k, eval env_with_inst te)) i.ti_values in
     Hashtbl.replace instances i.ti_name (VObject kvs)) tp.instances;
-  (* Higher tr_priority fires first; equal-priority preserves source order. *)
   let rules = List.stable_sort
     (fun a b -> compare b.tr_priority a.tr_priority) tp.rules in
-  { schemas; instances; rules }
+  { schemas; instances; predicates; rules }
 
 (* ---------- build object env from given ---------- *)
 
@@ -346,7 +371,9 @@ let build_env ctx (g : tgiven) =
     match Hashtbl.find_opt ctx.schemas g.tg_schema with
     | Some s -> s
     | None   -> err "test: unknown schema %s" g.tg_schema in
-  let env0 = { empty_env with instances = ctx.instances } in
+  let env0 = { empty_env with
+               instances = ctx.instances;
+               predicates = ctx.predicates } in
   let env_raw =
     List.fold_left (fun e (k, v) -> bind e k (eval e v)) env0 g.tg_values in
   List.fold_left (fun e (n, te) -> bind e n (eval e te))
@@ -354,8 +381,10 @@ let build_env ctx (g : tgiven) =
 
 (* Build an env from (field name → already-evaluated value) pairs and a
    schema. Used by Load when reading JSON inputs at runtime. *)
-let build_env_from_values ?(instances = Hashtbl.create 0) sch raw_pairs =
-  let env0 = { empty_env with instances } in
+let build_env_from_values ?(instances = Hashtbl.create 0)
+                          ?(predicates = Hashtbl.create 0)
+                          sch raw_pairs =
+  let env0 = { empty_env with instances; predicates } in
   let env_raw =
     List.fold_left (fun e (k, v) -> bind e k v) env0 raw_pairs in
   List.fold_left (fun e (n, te) -> bind e n (eval e te))
@@ -426,7 +455,9 @@ let report ?(explain_failures = true) (results, all_rules) =
         | None -> ()
         | Some env ->
             let ctx = { schemas = Hashtbl.create 0;
-                        instances = env.instances; rules = all_rules } in
+                        instances = env.instances;
+                        predicates = env.predicates;
+                        rules = all_rules } in
             (* Use a temporary explain call. We can't actually call Explain
                from here without a circular dep — provide an inline simpler
                trace: for each rule, show fired status + first failing pred. *)

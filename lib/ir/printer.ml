@@ -42,6 +42,7 @@ let rec pp_expr e =
   | EIsPresent e    -> Printf.sprintf "(%s is present)" (pp_expr e)
   | ECall (f, args) ->
       Printf.sprintf "%s(%s)" f (String.concat ", " (List.map pp_expr args))
+  | ESelf -> "self"
 
 let rec pp_ty_annot = function
   | AnnScalar s -> s
@@ -74,7 +75,7 @@ let pp_top = function
       Printf.sprintf "@%s(%S)" mkey mvalue
   | TAction { asname; asparams; _ } ->
       let ps = String.concat ", "
-        (List.map (fun p ->
+        (List.map (fun (p : action_param) ->
            Printf.sprintf "%s: %s" p.pname (pp_ty_annot p.ptype))
            asparams) in
       Printf.sprintf "@action %s(%s)" asname ps
@@ -110,5 +111,11 @@ let pp_top = function
         | Some s -> Printf.sprintf "  \"\"\"%s\"\"\"\n" s in
       Printf.sprintf "rule %s%s%s:\n%s  when:\n%s\n  then:\n%s"
         name on prio desc preds acts
+  | TPredicate p ->
+      let params = String.concat ", "
+        (List.map (fun (n, t, _) ->
+           Printf.sprintf "%s: %s" n (pp_ty_annot t)) p.pparams) in
+      Printf.sprintf "predicate %s on { %s }:\n  %s"
+        p.pname params (pp_expr p.pbody)
 
 let pp_program p = String.concat "\n\n" (List.map pp_top p)

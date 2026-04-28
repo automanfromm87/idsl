@@ -22,9 +22,10 @@ type outcome = string * value list
 
 type env
 type ctx = {
-  schemas   : (ident, tschema) Hashtbl.t;
-  instances : (ident, value) Hashtbl.t;
-  rules     : trule list;
+  schemas    : (ident, tschema) Hashtbl.t;
+  instances  : (ident, value) Hashtbl.t;
+  predicates : (ident, texpr) Hashtbl.t;
+  rules      : trule list;
 }
 
 type test_result = {
@@ -60,6 +61,7 @@ val eval : env -> texpr -> value
    Used by Load to bridge JSON → runtime. *)
 val build_env_from_values :
   ?instances:(ident, value) Hashtbl.t ->
+  ?predicates:(ident, texpr) Hashtbl.t ->
   tschema -> (ident * value) list -> env
 
 (* Per-program context: schema table, instance table (lazily evaluated),

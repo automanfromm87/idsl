@@ -30,7 +30,8 @@ type ref_site = {
 let decl_token_length (s : Symbol.t) : int =
   match s.kind with
   | KTest _ -> String.length s.decl_name + 2
-  | KSchema _ | KInstance _ | KAction _ | KField _ | KRule _ ->
+  | KSchema _ | KInstance _ | KAction _ | KPredicate _
+  | KField _ | KRule _ ->
       String.length s.decl_name
 
 type t = {
@@ -59,15 +60,17 @@ let qualify = Typecheck.qualify
 let resolve_ref = Typecheck.resolve_key
 
 type canon_tables = {
-  schemas   : (string, unit) Hashtbl.t;
-  instances : (string, unit) Hashtbl.t;
-  actions   : (string, unit) Hashtbl.t;
+  schemas    : (string, unit) Hashtbl.t;
+  instances  : (string, unit) Hashtbl.t;
+  actions    : (string, unit) Hashtbl.t;
+  predicates : (string, unit) Hashtbl.t;
 }
 
 let collect_canon_tables (prog : Ast.program) : canon_tables =
-  let schemas   = Ast.new_table () in
-  let instances = Ast.new_table () in
-  let actions   = Ast.new_table () in
+  let schemas    = Ast.new_table () in
+  let instances  = Ast.new_table () in
+  let actions    = Ast.new_table () in
+  let predicates = Ast.new_table () in
   List.iter (function
     | Ast.TSchema s ->
         Hashtbl.replace schemas (qualify s.sdomain s.sname) ()
@@ -75,9 +78,11 @@ let collect_canon_tables (prog : Ast.program) : canon_tables =
         Hashtbl.replace instances (qualify i.idomain i.iname) ()
     | Ast.TAction a ->
         Hashtbl.replace actions (qualify a.asdomain a.asname) ()
+    | Ast.TPredicate p ->
+        Hashtbl.replace predicates (qualify p.pdomain p.pname) ()
     | Ast.TRule _ | Ast.TTest _ | Ast.TMeta _ | Ast.TInclude _ -> ())
     prog;
-  { schemas; instances; actions }
+  { schemas; instances; actions; predicates }
 
 (* ---------- collect declarations from AST ---------- *)
 
@@ -118,6 +123,10 @@ let collect_decls idx (prog : Ast.program) (_root : Cst.node) =
         let q = qualify a.asdomain a.asname in
         let k = Symbol.KAction q in
         mk k ~bare:a.asname a.aspos k
+    | Ast.TPredicate p ->
+        let q = qualify p.pdomain p.pname in
+        let k = Symbol.KPredicate q in
+        mk k ~bare:p.pname p.pname_pos k
     | Ast.TMeta _ | Ast.TInclude _ -> ()) prog
 
 (* Schema references that live in declaration heads (not inside typed
@@ -161,7 +170,7 @@ let collect_field_assign_refs idx (prog : Ast.program) (canon : canon_tables) =
    `~schema` is the canonical key (qualified) — typecheck has already
    resolved it before storing it on tr_schema / tg_schema / ti_schema. *)
 
-let walk_expr ~schema idx (root : texpr) =
+let walk_expr ~schema ~canon idx (root : texpr) =
   iter_expr (fun (e : texpr) ->
     match e.node with
     | TVar (VarField name) ->
@@ -169,7 +178,12 @@ let walk_expr ~schema idx (root : texpr) =
     | TVar (VarInstance name) ->
         add_ref idx (KInstance name) ~length:(String.length name) e.pos
     | TCall (name, _) ->
-        add_ref idx (KAction name) ~length:(String.length name) e.pos
+        let kind =
+          if Hashtbl.mem canon.predicates name
+          then Symbol.KPredicate name
+          else Symbol.KAction name
+        in
+        add_ref idx kind ~length:(String.length name) e.pos
     | TPath (recv, fpos, fname) ->
         (* recv.ty is the canonical schema key after typecheck. *)
         (match recv.ty with
@@ -230,31 +244,34 @@ let collect_schema_list_refs idx (prog : Ast.program) (canon : canon_tables) =
           | _ -> ()) s.sfields
     | _ -> ()) prog
 
-let collect_typed_refs idx (tp : tprogram) =
+let collect_typed_refs idx (tp : tprogram) (canon : canon_tables) =
+  let walk = walk_expr ~canon idx in
   List.iter (fun (s : tschema) ->
     List.iter (function
       | TFRaw _ -> ()
-      | TFDerived (_, body) -> walk_expr ~schema:s.ts_name idx body)
+      | TFDerived (_, body) -> walk ~schema:s.ts_name body)
       s.ts_fields) tp.schemas;
   List.iter (fun (r : trule) ->
-    List.iter (walk_expr ~schema:r.tr_schema idx) r.tr_when;
+    List.iter (walk ~schema:r.tr_schema) r.tr_when;
     List.iter (fun ((cpos, name, args) : tcall) ->
       add_ref idx (KAction name) ~length:(String.length name) cpos;
-      List.iter (walk_expr ~schema:r.tr_schema idx) args) r.tr_then)
+      List.iter (walk ~schema:r.tr_schema) args) r.tr_then)
     tp.rules;
   List.iter (fun (t : ttest) ->
     let sname = t.tt_given.tg_schema in
-    List.iter (fun (_, te) -> walk_expr ~schema:sname idx te)
+    List.iter (fun (_, te) -> walk ~schema:sname te)
       t.tt_given.tg_values;
     List.iter (function
       | TMust ((cpos, name, args) : tcall)
       | TMustNot (cpos, name, args) ->
           add_ref idx (KAction name) ~length:(String.length name) cpos;
-          List.iter (walk_expr ~schema:sname idx) args)
+          List.iter (walk ~schema:sname) args)
       t.tt_expect) tp.tests;
   List.iter (fun (i : tinstance) ->
-    List.iter (fun (_, te) -> walk_expr ~schema:i.ti_schema idx te)
-      i.ti_values) tp.instances
+    List.iter (fun (_, te) -> walk ~schema:i.ti_schema te)
+      i.ti_values) tp.instances;
+  List.iter (fun (p : tpredicate) ->
+    walk ~schema:p.tp_name p.tp_body) tp.predicates
 
 (* ---------- public build ---------- *)
 
@@ -265,7 +282,7 @@ let build (prog : Ast.program) (tp : tprogram) (cst : Cst.node) : t =
   collect_schema_list_refs idx prog canon;
   collect_decl_refs idx prog canon;
   collect_field_assign_refs idx prog canon;
-  collect_typed_refs idx tp;
+  collect_typed_refs idx tp canon;
   idx
 
 (* ---------- queries ---------- *)

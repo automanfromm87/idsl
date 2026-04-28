@@ -36,6 +36,9 @@ and tnode =
   | TIsMissing of texpr
   | TIsPresent of texpr
   | TCall      of ident * texpr list
+  | TSelf      of (ident * Types.ty) list   (* snapshot of the schema's
+                                               field types at the
+                                               occurrence site *)
 
 type tfield =
   | TFRaw     of ident * Types.ty
@@ -98,13 +101,22 @@ type taction = {
   ta_pos    : Ast.pos;
 }
 
+type tpredicate = {
+  tp_name   : ident;           (* canonical: domain.bare *)
+  tp_bare   : ident;
+  tp_params : (ident * Types.ty) list;
+  tp_body   : texpr;
+  tp_pos    : Ast.pos;
+}
+
 type tprogram = {
-  schemas   : tschema list;
-  rules     : trule list;
-  tests     : ttest list;
-  instances : tinstance list;
-  actions   : taction list;
-  metas     : Ast.metadata list;
+  schemas    : tschema list;
+  rules      : trule list;
+  tests      : ttest list;
+  instances  : tinstance list;
+  actions    : taction list;
+  predicates : tpredicate list;
+  metas      : Ast.metadata list;
 }
 
 (* ---------- helpers ---------- *)
@@ -141,6 +153,7 @@ let rec iter_expr f e =
   | TSum (g, _, _, p)      -> iter_expr f g; iter_expr f p
   | TCall (_, args)        -> List.iter (iter_expr f) args
   | TLit _ | TVar _
+  | TSelf _
   | TWildcard | TMissing   -> ()
 
 (* ---------- pretty-print ---------- *)
@@ -186,6 +199,7 @@ let rec pp_expr (e : texpr) =
   | TIsPresent e -> Printf.sprintf "(%s is present)" (pp_expr e)
   | TCall (f, args) ->
       Printf.sprintf "%s(%s)" f (String.concat ", " (List.map pp_expr args))
+  | TSelf _      -> "self"
 
 let pp_call (_pos, n, args) =
   Printf.sprintf "%s(%s)" n (String.concat ", " (List.map pp_expr args))
@@ -233,11 +247,19 @@ let pp_instance i =
        Printf.sprintf "  %s = %s" k (pp_expr v)) i.ti_values) in
   Printf.sprintf "instance %s %s:\n%s" i.ti_schema i.ti_bare body
 
+let pp_predicate p =
+  let params = String.concat ", "
+    (List.map (fun (n, t) -> Printf.sprintf "%s: %s" n (Types.pp_ty t))
+       p.tp_params) in
+  Printf.sprintf "predicate %s on { %s }:\n  %s"
+    p.tp_name params (pp_expr p.tp_body)
+
 let pp_program tp =
   let parts =
     List.map pp_meta tp.metas
     @ List.map pp_schema tp.schemas
     @ List.map pp_instance tp.instances
+    @ List.map pp_predicate tp.predicates
     @ List.map pp_rule tp.rules
     @ List.map pp_test tp.tests
   in

@@ -132,6 +132,7 @@ and lower_atom_leaf (t : Cst.tok) : expr_node =
   match t.kind with
   | Cst.Ident s -> EVar s
   | Cst.KW "missing" -> EMissing
+  | Cst.KW "self"    -> ESelf
   | Cst.Punct "_" -> EWildcard
   | _ -> err "atom leaf has unexpected kind %S" t.text
 
@@ -312,6 +313,34 @@ let lower_action_sig (n : node) : action_sig =
         asdomain = None }
   | _ -> err "action_sig shape"
 
+let lower_predicate_sig (n : node) : (ident * ty_annot * Lexing.position) list =
+  List.filter_map (function
+    | GNode p when p.nkind = NActionParam ->
+        (match significant p.nchildren with
+         | [GTok name; GTok _c; GNode ty] ->
+             Some (tok_text name, lower_ty_annot ty, name.start)
+         | _ -> err "predicate sig pair shape")
+    | _ -> None) (significant n.nchildren)
+
+let lower_predicate (n : node) : predicate_def =
+  let kids = significant n.nchildren in
+  match kids with
+  | _pk :: GTok name :: _on :: GNode sig_ :: _c :: rest ->
+      let body = List.find_map (function
+        | GNode e when e.nkind = NExpr || e.nkind = NAtom || e.nkind = NLiteral ->
+            Some (lower_expr e)
+        | _ -> None) rest in
+      (match body with
+       | Some pbody ->
+           { pname     = tok_text name;
+             pname_pos = name.start;
+             ppos      = fst n.nspan;
+             pparams   = lower_predicate_sig sig_;
+             pbody;
+             pdomain   = None }
+       | None -> err "predicate has no body")
+  | _ -> err "predicate shape"
+
 (* Reuse field / given_assign / etc. for instance bodies. *)
 let lower_given_assign (n : node) : field_assign =
   match significant n.nchildren with
@@ -465,11 +494,12 @@ let domain_name_of (n : node) : ident option =
    AST keeps decl names *bare*; the domain is sibling metadata used by
    resolve / typecheck / Symbol for scoped lookups. *)
 let attach_domain ~domain : top -> top = function
-  | TSchema   s -> TSchema   { s with sdomain = domain }
-  | TRule     r -> TRule     { r with rdomain = domain }
-  | TTest     t -> TTest     { t with tdomain = domain }
-  | TInstance i -> TInstance { i with idomain = domain }
-  | TAction   a -> TAction   { a with asdomain = domain }
+  | TSchema    s -> TSchema    { s with sdomain = domain }
+  | TRule      r -> TRule      { r with rdomain = domain }
+  | TTest      t -> TTest      { t with tdomain = domain }
+  | TInstance  i -> TInstance  { i with idomain = domain }
+  | TAction    a -> TAction    { a with asdomain = domain }
+  | TPredicate p -> TPredicate { p with pdomain = domain }
   | (TMeta _ | TInclude _) as other -> other
 
 let lower_program (root : node) : Ast.program =
@@ -478,13 +508,14 @@ let lower_program (root : node) : Ast.program =
     match g with
     | GNode n ->
         (match n.nkind with
-         | NMetadata -> [TMeta     (lower_metadata    n)]
-         | NAction   -> [attach_domain ~domain (TAction   (lower_action_sig  n))]
-         | NSchema   -> [attach_domain ~domain (TSchema   (lower_schema      n))]
-         | NRule     -> [attach_domain ~domain (TRule     (lower_rule        n))]
-         | NTest     -> [attach_domain ~domain (TTest     (lower_test        n))]
-         | NInstance -> [attach_domain ~domain (TInstance (lower_instance    n))]
-         | NInclude  -> [TInclude  (lower_include     n)]
+         | NMetadata  -> [TMeta      (lower_metadata     n)]
+         | NAction    -> [attach_domain ~domain (TAction    (lower_action_sig n))]
+         | NSchema    -> [attach_domain ~domain (TSchema    (lower_schema     n))]
+         | NRule      -> [attach_domain ~domain (TRule      (lower_rule       n))]
+         | NTest      -> [attach_domain ~domain (TTest      (lower_test       n))]
+         | NInstance  -> [attach_domain ~domain (TInstance  (lower_instance   n))]
+         | NPredicate -> [attach_domain ~domain (TPredicate (lower_predicate  n))]
+         | NInclude   -> [TInclude   (lower_include    n)]
          | NDomain   ->
              (* Phase-1 limit: nested domain blocks flatten into the
                 outermost one (the bare name wins).  We don't yet

@@ -47,6 +47,10 @@ and expr_node =
   | EIsMissing of expr
   | EIsPresent of expr
   | ECall      of ident * expr list        (* call name's pos = e.e_pos *)
+  | ESelf                                  (* `self` keyword: the
+                                              current schema's row;
+                                              valid only inside a
+                                              schema context *)
 
 let mke pos endpos node = { e_node = node; e_pos = pos; e_endpos = endpos }
 
@@ -128,6 +132,18 @@ type test_def = {
 
 type action_param = { pname : ident; ptype : ty_annot; ppos : pos }
 
+(* `predicate name on { F: T, ... }: body`. Pure-Bool named expression.
+   The signature is structural: any object whose fields cover the
+   declared (name, type) pairs satisfies the predicate. *)
+type predicate_def = {
+  pname     : ident;
+  pname_pos : pos;
+  ppos      : pos;
+  pparams   : (ident * ty_annot * pos) list;
+  pbody     : expr;
+  pdomain   : ident option;
+}
+
 type action_sig = {
   asname    : ident;
   asparams  : action_param list;
@@ -148,13 +164,14 @@ type instance_def = {
 type include_decl = { inc_path : string; inc_pos : pos }
 
 type top =
-  | TSchema   of schema_def
-  | TRule     of rule_def
-  | TMeta     of metadata
-  | TTest     of test_def
-  | TAction   of action_sig
-  | TInstance of instance_def
-  | TInclude  of include_decl
+  | TSchema    of schema_def
+  | TRule      of rule_def
+  | TMeta      of metadata
+  | TTest      of test_def
+  | TAction    of action_sig
+  | TInstance  of instance_def
+  | TInclude   of include_decl
+  | TPredicate of predicate_def
 
 type program = top list
 
@@ -164,11 +181,12 @@ let field_name = function FRaw (_, n, _) | FDerived (_, n, _) -> n
 let field_pos  = function FRaw (p, _, _) | FDerived (p, _, _) -> p
 let field_names fs = List.map field_name fs
 
-let schemas p = List.filter_map (function TSchema s -> Some s | _ -> None) p
-let rules   p = List.filter_map (function TRule r   -> Some r | _ -> None) p
-let tests   p = List.filter_map (function TTest t   -> Some t | _ -> None) p
-let actions   p = List.filter_map (function TAction a   -> Some a | _ -> None) p
-let instances p = List.filter_map (function TInstance i -> Some i | _ -> None) p
+let schemas p    = List.filter_map (function TSchema s -> Some s | _ -> None) p
+let rules   p    = List.filter_map (function TRule r   -> Some r | _ -> None) p
+let tests   p    = List.filter_map (function TTest t   -> Some t | _ -> None) p
+let actions   p  = List.filter_map (function TAction a   -> Some a | _ -> None) p
+let instances p  = List.filter_map (function TInstance i -> Some i | _ -> None) p
+let predicates p = List.filter_map (function TPredicate p' -> Some p' | _ -> None) p
 
 (* Visit every sub-expression node, including the input. *)
 let rec iter_expr f e =
@@ -188,6 +206,7 @@ let rec iter_expr f e =
   | ESum (g, _, _, p)     -> iter_expr f g; iter_expr f p
   | ECall (_, args)       -> List.iter (iter_expr f) args
   | EVar _ | ELit _
+  | ESelf
   | EWildcard | EMissing  -> ()
 
 exception Cycle of ident

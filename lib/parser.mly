@@ -24,6 +24,7 @@ let opt = function Some x -> [x] | None -> []
 %token <Cst.tok> EG IE
 %token <Cst.tok> TEST GIVEN EXPECT
 %token <Cst.tok> ACTION INSTANCE ON PRIORITY INCLUDE DOMAIN
+%token <Cst.tok> PREDICATE SELF
 %token <Cst.tok> COLON COMMA LPAREN RPAREN LBRACKET RBRACKET LBRACE RBRACE
 %token <Cst.tok> DOT AT PIPE
 %token <Cst.tok> EQEQ NEQ LEQ GEQ LT GT EQ UNDERSCORE
@@ -98,13 +99,14 @@ top_seq:
   | t=top trail=nls rest=top_seq { (t :: gs trail) @ rest }
 
 top:
-  | m=metadata     { m }
-  | a=action_sig   { a }
-  | s=schema_def   { s }
-  | r=rule_def     { r }
-  | t=test_def     { t }
-  | i=instance_def { i }
-  | i=include_dir  { i }
+  | m=metadata      { m }
+  | a=action_sig    { a }
+  | s=schema_def    { s }
+  | r=rule_def      { r }
+  | t=test_def      { t }
+  | i=instance_def  { i }
+  | i=include_dir   { i }
+  | p=predicate_def { p }
 
 include_dir:
   | inc=INCLUDE p=STRING
@@ -135,6 +137,27 @@ action_sig:
 action_param:
   | name=IDENT c=COLON t=ty_annot
     { mk Cst.NActionParam $startpos $endpos [g name; g c; t] }
+
+(* ---------- predicate ---------- *)
+
+predicate_def:
+  | pk=PREDICATE name=IDENT on=ON sig_=record_ty c=COLON n0=nls
+    body=expr nlt=NEWLINE n1=nls
+    { mk Cst.NPredicate $startpos $endpos
+        ([g pk; g name; g on; sig_; g c] @ gs n0 @ [body; g nlt] @ gs n1) }
+
+record_ty:
+  | lb=LBRACE pairs=comma_seq_record rb=RBRACE
+    { mk Cst.NPredicateSig $startpos $endpos ([g lb] @ pairs @ [g rb]) }
+
+record_ty_pair:
+  | name=IDENT c=COLON t=ty_annot
+    { mk Cst.NActionParam $startpos $endpos [g name; g c; t] }
+
+comma_seq_record:
+  | { [] }
+  | x=record_ty_pair { [x] }
+  | x=record_ty_pair c=COMMA rest=comma_seq_record { x :: g c :: rest }
 
 ty_annot:
   | id=IDENT
@@ -297,6 +320,8 @@ atom:
     { mk Cst.NAtom $startpos $endpos [g mk1; g lp; e1; g c; e2; g rp] }
   | id=IDENT
     { mk Cst.NAtom $startpos $endpos [g id] }
+  | s=SELF
+    { mk Cst.NAtom $startpos $endpos [g s] }
   | mi=MISSING
     { mk Cst.NAtom $startpos $endpos [g mi] }
   | u=UNDERSCORE

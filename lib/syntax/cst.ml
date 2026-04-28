@@ -128,6 +128,8 @@ type node_kind =
   | NInstance
   | NInclude
   | NDomain
+  | NPredicate
+  | NPredicateSig
   | NField
   | NFieldBody
   | NExample
@@ -159,6 +161,8 @@ let pp_node_kind = function
   | NInstance     -> "Instance"
   | NInclude      -> "Include"
   | NDomain       -> "Domain"
+  | NPredicate    -> "Predicate"
+  | NPredicateSig -> "PredicateSig"
   | NField        -> "Field"
   | NFieldBody    -> "FieldBody"
   | NExample      -> "Example"

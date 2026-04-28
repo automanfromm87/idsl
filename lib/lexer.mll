@@ -30,7 +30,8 @@ let is_keyword = function
   | "of" | "in" | "where" | "is" | "missing" | "present"
   | "true" | "false" | "min" | "max" | "for"
   | "test" | "given" | "expect" | "action" | "instance"
-  | "on" | "priority" | "include" | "domain" -> true
+  | "on" | "priority" | "include" | "domain"
+  | "predicate" | "self" -> true
   | _ -> false
 
 (* tokens after which a newline is treated as continuation *)
@@ -135,6 +136,8 @@ rule token = parse
           | "priority" -> (fun ct -> PRIORITY ct)
           | "include"  -> (fun ct -> INCLUDE ct)
           | "domain"   -> (fun ct -> DOMAIN ct)
+          | "predicate" -> (fun ct -> PREDICATE ct)
+          | "self"     -> (fun ct -> SELF ct)
           | _ -> assert false
         in
         emit_log lexbuf (KW id) parser_tok_ctor

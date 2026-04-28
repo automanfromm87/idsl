@@ -8,19 +8,25 @@ open Types
 open Typed
 
 type action_param_ty = { pty_name : ident; pty : ty }
+type predicate_sig = { ps_params : (ident * ty) list }
+
 type env = {
   schemas        : (ident, tschema) Hashtbl.t;
   actions        : (ident, action_param_ty list) Hashtbl.t;
+  predicates     : (ident, predicate_sig) Hashtbl.t;
   instances      : (ident, ident) Hashtbl.t;
   fields         : (ident * ty) list;
   vars           : (ident * ty) list;
   strict_calls   : bool;
   current_domain : ident option;
+  current_schema : ident option;   (* canonical schema key of the
+                                      enclosing context, if any *)
 }
 
-let make_env ?(strict_calls = false) schemas actions instances =
-  { schemas; actions; instances; fields = []; vars = []; strict_calls;
-    current_domain = None }
+let make_env ?(strict_calls = false) ?(predicates = Hashtbl.create 0)
+    schemas actions instances =
+  { schemas; actions; predicates; instances; fields = []; vars = [];
+    strict_calls; current_domain = None; current_schema = None }
 
 (* Domain-aware key derivation.  All decl tables (schemas / instances /
    actions) are keyed on the *qualified* name "domain.bare", with no
@@ -121,6 +127,15 @@ let rec infer env e : texpr =
   | ELit l    -> mk (TLit l) (infer_lit l)
   | EWildcard -> mk TWildcard TAny
   | EMissing  -> mk TMissing TMissing
+  | ESelf ->
+      (match env.current_schema with
+       | None -> err "`self` used outside any schema context"
+       | Some _ ->
+           (* `self` is structural: any predicate that accepts a record
+              type matching the current schema's fields can accept it.
+              The TSelf node carries the field snapshot so eval can
+              build a VObject without consulting the schemas table. *)
+           mk (TSelf env.fields) (TObject env.fields))
   | EVar id ->
       (match resolve_var env id with
        | Some (v, t) -> mk (TVar v) t
@@ -187,8 +202,40 @@ let rec infer env e : texpr =
          && (is_numeric tb.ty || tb.ty = TMissing)
       then mk (TCall (name, [ta; tb])) (arith_result ta.ty tb.ty)
       else err "%s requires numeric operands" name
-  | ECall (name, _) ->
-      err "function `%s` not allowed in expression context" name
+  | ECall (name, args) ->
+      (* Predicate call: `is_high_risk(self)`. The signature is a
+         structural record type; the single argument must expose every
+         declared (field, type) pair of the predicate's signature. *)
+      (match scoped_find_canon env.predicates env name with
+       | None ->
+           err "function `%s` not allowed in expression context" name
+       | Some (canon, ps) ->
+           if List.length args <> 1 then
+             err "predicate %s expects 1 argument, got %d"
+               name (List.length args);
+           let arg = List.hd args in
+           let ta = infer env arg in
+           let arg_fields = match ta.ty with
+             | TObject kvs -> kvs
+             | TSchema s ->
+                 (match scoped_find env.schemas env s with
+                  | Some ts -> ts.ts_types
+                  | None    -> err "predicate %s: unknown schema %s for argument" name s)
+             | TAny -> []
+             | _ -> err "predicate %s expects an object/schema argument, got %s"
+                      name (pp_ty ta.ty)
+           in
+           List.iter (fun (k, expected) ->
+             match List.assoc_opt k arg_fields with
+             | None ->
+                 err "predicate %s: argument missing field `%s : %s`"
+                   name k (pp_ty expected)
+             | Some actual ->
+                 (try ignore (unify expected actual)
+                  with Type_error m ->
+                    err "predicate %s field `%s`: %s" name k m))
+             ps.ps_params;
+           mk (TCall (canon, [ta])) TBool)
 
 and field_type ?pos env ot f =
   let prefix = match pos with
@@ -325,7 +372,7 @@ let infer_field_type ?domain schemas (decl : field_decl) : Types.ty =
       let _ = check env e resolved in   (* raises Type_error on mismatch *)
       resolved
 
-let typecheck_schema schemas actions sch =
+let typecheck_schema schemas actions predicates sch =
   let errors = ref [] in
   let push d = errors := d :: !errors in
   let raw_pairs = List.filter_map (function
@@ -347,9 +394,11 @@ let typecheck_schema schemas actions sch =
   let derived_typed_acc, all_types =
     List.fold_left (fun (dacc, tyacc) (n, e) ->
       let env =
-        { schemas; actions; instances = Hashtbl.create 0;
+        { schemas; actions; predicates;
+          instances = Hashtbl.create 0;
           fields = tyacc; vars = []; strict_calls = false;
-          current_domain = sch.sdomain } in
+          current_domain = sch.sdomain;
+          current_schema = Some (qualify sch.sdomain sch.sname) } in
       match (try `Ok (infer env e) with Type_error m -> `Err m) with
       | `Ok te -> ((n, te) :: dacc, tyacc @ [(n, te.ty)])
       | `Err m ->
@@ -386,6 +435,7 @@ let pick_schema_for_rule env r =
       | EVar id when not (scoped_mem env.schemas env id) ->
           if not (List.mem id !referenced) then referenced := id :: !referenced
       | EVar _ | ELit _ | EList _ | EObject _ | EWildcard | EMissing
+      | ESelf
       | EUnary _ | EBin _ | EIf _ | EAny _ | EEvery _ | ECount _ | ESum _
       | EIsMissing _ | EIsPresent _ | ECall _ | EField _ -> ()) e in
   List.iter collect r.rwhen;
@@ -440,6 +490,7 @@ let typecheck_call env (e : expr) : tcall =
              in ()) sig_params targs;
            (e.e_pos, canon, targs))
   | EVar _ | EField _ | ELit _ | EList _ | EObject _ | EWildcard | EMissing
+  | ESelf
   | EUnary _ | EBin _ | EIf _ | EAny _ | EEvery _ | ECount _ | ESum _
   | EIsMissing _ | EIsPresent _ -> err "expected a call expression"
 
@@ -459,7 +510,7 @@ let typecheck_rule env r =
          | None ->
              err_at r.rpos "rule %s: schema %s not found" where canon)
   in
-  let env' = { env with fields = ts.ts_types } in
+  let env' = { env with fields = ts.ts_types; current_schema = Some sname } in
   let twhen = List.map (fun (pos, p) ->
     if has_wildcard p then
       err_at pos "rule %s when: `_` only allowed in test expect calls" where;
@@ -483,7 +534,8 @@ let typecheck_test env t =
     | None ->
         err_at t.tpos "test %S: unknown schema %s" t.tname bare_sname
   in
-  let env_g = { env with fields = ts.ts_types } in
+  let env_g = { env with fields = ts.ts_types;
+                         current_schema = Some canon_sname } in
   let givens = List.map (fun a ->
     match List.assoc_opt a.aname ts.ts_types with
     | None -> err_at a.apos "test %S: no field `%s` in schema %s"
@@ -517,7 +569,8 @@ let typecheck_instance env i =
     | None   ->
         err_at i.ipos "instance %s: unknown schema %s" i.iname i.ischema
   in
-  let env_g = { env with fields = ts.ts_types } in
+  let env_g = { env with fields = ts.ts_types;
+                         current_schema = Some canon_schema } in
   let values = List.map (fun a ->
     match List.assoc_opt a.aname ts.ts_types with
     | None -> err_at a.apos "instance %s: no field `%s` in schema %s"
@@ -609,12 +662,37 @@ let run program =
                             ta_params = List.map (fun p -> (p.pty_name, p.pty)) params;
                             ta_pos = a.aspos } :: !action_decls
         end) (Ast.actions program);
+  (* Predicates: resolve param signatures up front (bodies typecheck
+     after env is fully populated). Doing this *before* schemas means
+     a derived field body can call a predicate. *)
+  let predicates : (ident, predicate_sig) Hashtbl.t = Hashtbl.create 8 in
+  let predicate_param_meta = Hashtbl.create 8 in
+  List.iter (fun (p : Ast.predicate_def) ->
+    let key = qualify p.pdomain p.pname in
+    if Hashtbl.mem predicates key then
+      push (mkdiag p.pname_pos
+              (Printf.sprintf "duplicate predicate %s" key))
+    else
+      let resolved =
+        try
+          List.map (fun (n, ty, pos) ->
+            (n, resolve_ty_annot ?domain:p.pdomain schemas ty, pos))
+            p.pparams
+        with Type_error m ->
+          push (mkdiag p.ppos
+            (Printf.sprintf "predicate %s sig: %s" p.pname m));
+          []
+      in
+      Hashtbl.add predicates key
+        { ps_params = List.map (fun (n, t, _) -> (n, t)) resolved };
+      Hashtbl.add predicate_param_meta key (resolved, p)
+    ) (Ast.predicates program);
   let schema_pos : (ident, Lexing.position) Hashtbl.t = Hashtbl.create 16 in
   let tschemas =
     List.filter_map (fun s ->
       let key = qualify s.sdomain s.sname in
       Hashtbl.replace schema_pos key s.spos;
-      let tsch, errs = typecheck_schema schemas actions s in
+      let tsch, errs = typecheck_schema schemas actions predicates s in
       Hashtbl.replace schemas key tsch;
       List.iter push errs;
       Some tsch) (Ast.schemas program) in
@@ -631,7 +709,7 @@ let run program =
     List.exists (function
       | Ast.TMeta { mkey = "strict_actions"; _ } -> true
       | _ -> false) program in
-  let env = make_env ~strict_calls schemas actions instances in
+  let env = make_env ~strict_calls ~predicates schemas actions instances in
   let tinstances =
     List.filter_map (fun i ->
       match with_diag i.ipos (fun () -> typecheck_instance env i) with
@@ -647,11 +725,31 @@ let run program =
       match with_diag t.tpos (fun () -> typecheck_test env t) with
       | `Ok tt -> Some tt
       | `Err d -> push d; None) (Ast.tests program) in
+  (* Predicate bodies — env is fully populated now, so the body sees
+     other predicates and actions defined later. *)
+  let tpredicates =
+    Hashtbl.fold (fun key (resolved, (p : Ast.predicate_def)) acc ->
+      let body_env =
+        { env with
+          fields = List.map (fun (n, t, _) -> (n, t)) resolved;
+          current_domain = p.pdomain;
+          current_schema = None } in
+      let result = with_diag p.ppos (fun () ->
+        let tbody = check body_env p.pbody TBool in
+        { tp_name   = key;
+          tp_bare   = p.pname;
+          tp_params = List.map (fun (n, t, _) -> (n, t)) resolved;
+          tp_body   = tbody;
+          tp_pos    = p.pname_pos }) in
+      match result with
+      | `Ok tp -> tp :: acc
+      | `Err d -> push d; acc
+    ) predicate_param_meta [] in
   let metas =
     List.filter_map (function
       | TMeta m -> Some m
       | TSchema _ | TRule _ | TTest _ | TAction _ | TInstance _
-      | TInclude _ -> None)
+      | TInclude _ | TPredicate _ -> None)
       program in
   (* Any unresolved TInclude here means parse_string was used (browser path);
      surface a clear error instead of silently dropping. *)
@@ -663,5 +761,6 @@ let run program =
   match List.rev !errors with
   | [] -> Ok { schemas = tschemas; rules = trules; tests = ttests;
                instances = tinstances; actions = List.rev !action_decls;
+               predicates = tpredicates;
                metas }
   | es -> Error es

@@ -51,6 +51,7 @@ let check_list_element env ~domain where e =
       report env ~pos:e.e_pos
         (Printf.sprintf "%s: unknown schema reference %S" where id)
   | EVar _ | ELit _ | EList _ | EObject _ | EWildcard | EMissing
+  | ESelf
   | EUnary _ | EBin _ | EIf _ | EAny _ | EEvery _ | ECount _ | ESum _
   | EIsMissing _ | EIsPresent _ | ECall _ | EField _ -> ()
 

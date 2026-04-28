@@ -25,6 +25,7 @@ type kind =
   | KTest     of string                   (* canonical: "domain.<test name>" *)
   | KInstance of ident                    (* canonical instance key *)
   | KAction   of ident                    (* canonical @action key *)
+  | KPredicate of ident                   (* canonical predicate key *)
 
 type t = {
   kind      : kind;
@@ -44,3 +45,4 @@ let label_of_kind = function
   | KTest n           -> Printf.sprintf "test %S" n
   | KInstance n       -> "instance " ^ n
   | KAction n         -> "@action " ^ n
+  | KPredicate n      -> "predicate " ^ n

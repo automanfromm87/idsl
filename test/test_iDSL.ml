@@ -85,6 +85,87 @@ let () =
   - Amount: Money e.g. true
 |};
 
+  assert_tc_ok "predicate decl + self call from derived field"
+    {|predicate is_high_risk on { Value: Money, IsRenewal: Bool }:
+  Value > $1,000,000 and not IsRenewal
+
+schema Contract:
+  - Value: Money e.g. $500,000
+  - IsRenewal: e.g. true
+  - IsHighRisk: i.e. is_high_risk(self)
+|};
+
+  assert_tc_err "predicate rejects schema missing a required field"
+    "missing field"
+    {|predicate is_high_risk on { Value: Money, IsRenewal: Bool }:
+  Value > $1,000,000
+
+schema Amendment:
+  - Value: Money e.g. $1
+  - IsHighRisk: i.e. is_high_risk(self)
+|};
+
+  assert_tc_err "self inside predicate body errors"
+    "outside any schema"
+    {|predicate p on { X: Int }:
+  self == self
+|};
+
+  (* End-to-end: predicate is callable from a derived field, runtime
+     evaluates it against the schema's row, and the rule fires
+     accordingly. *)
+  (let src = {|@action notify(level: {Low, High})
+
+predicate is_high_risk on { Value: Money, IsRenewal: Bool }:
+  Value > $1,000,000 and not IsRenewal
+
+schema Contract:
+  - Value:      Money e.g. $1
+  - IsRenewal:  e.g. true
+  - IsHighRisk: i.e. is_high_risk(self)
+
+rule r on Contract:
+  when:
+    IsHighRisk
+  then:
+    notify(High)
+
+test "predicate fires on high-value non-renewal":
+  given Contract:
+    Value = $2,000,000
+    IsRenewal = false
+  expect:
+    notify(High)
+
+test "predicate stays off on renewal":
+  given Contract:
+    Value = $2,000,000
+    IsRenewal = true
+  expect:
+    not notify(_)
+|} in
+   match parse src with
+   | Error ds ->
+       Printf.printf "FAIL predicate runtime: parse %s\n" (pp_diags ds);
+       exit 1
+   | Ok p ->
+       (match IDSL.Typecheck.run p with
+        | Error ds ->
+            Printf.printf "FAIL predicate runtime: tc %s\n" (pp_diags ds);
+            exit 1
+        | Ok tp ->
+            let results, _ = IDSL.Eval.run_all tp in
+            let all_passed = List.for_all (fun r -> r.IDSL.Eval.passed) results in
+            if all_passed then Printf.printf "ok   predicate runtime smoke\n"
+            else begin
+              Printf.printf "FAIL predicate runtime smoke: tests failed\n";
+              List.iter (fun r ->
+                if not r.IDSL.Eval.passed then
+                  List.iter (fun f -> Printf.printf "       %s\n" f) r.failures)
+                results;
+              exit 1
+            end));
+
   assert_resolve_ok "list literal of schema ref"
     {|schema Party:
   - Name: e.g. "Alpha"

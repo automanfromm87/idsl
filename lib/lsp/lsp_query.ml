@@ -155,11 +155,13 @@ let lsp_kind_of_symbol_kind = function
   | Symbol.KTest _      -> kind_event
   | Symbol.KInstance _  -> kind_constant
   | Symbol.KAction _    -> kind_method
+  | Symbol.KPredicate _ -> kind_function
 
 let symbol_name = function
   | Symbol.KSchema n
   | Symbol.KInstance n
-  | Symbol.KAction n     -> n
+  | Symbol.KAction n
+  | Symbol.KPredicate n  -> n
   | Symbol.KField (_, n) -> n
   | Symbol.KRule path    -> String.concat "." path
   | Symbol.KTest n       -> n
@@ -616,7 +618,8 @@ let class_for_symbol_kind = function
   | Symbol.KSchema _    -> class_type
   | Symbol.KField _     -> property_type
   | Symbol.KRule _      -> function_type
-  | Symbol.KAction _    -> function_type
+  | Symbol.KAction _
+  | Symbol.KPredicate _ -> function_type
   | Symbol.KInstance _  -> variable_type
   | Symbol.KTest _      -> function_type
 
@@ -890,6 +893,7 @@ type call_item = {
 let call_data_of (k : Symbol.kind) : string =
   match k with
   | KAction n -> "action:" ^ n
+  | KPredicate n -> "predicate:" ^ n
   | KRule p   -> "rule:" ^ String.concat "." p
   | KSchema n -> "schema:" ^ n
   | KField (s, n) -> Printf.sprintf "field:%s.%s" s n
@@ -904,6 +908,7 @@ let call_data_to_kind (s : string) : Symbol.kind option =
     let rest   = String.sub s (i + 1) (String.length s - i - 1) in
     (match prefix with
      | "action"   -> Some (Symbol.KAction rest)
+     | "predicate" -> Some (Symbol.KPredicate rest)
      | "rule"     -> Some (Symbol.KRule (String.split_on_char '.' rest))
      | "schema"   -> Some (Symbol.KSchema rest)
      | "instance" -> Some (Symbol.KInstance rest)
@@ -1564,6 +1569,7 @@ let containing_schema (prog : Ast.program) (cursor : lsp_pos) : Ast.ident option
       | TRule r         -> Some r.rpos
       | TTest t         -> Some t.tpos
       | TInstance i     -> Some i.ipos
+      | TPredicate p    -> Some p.ppos
       | TAction _ | TMeta _ | TInclude _ -> None
     in match p with Some pp -> Some (pp, top) | None -> None) prog in
   let sorted = List.sort (fun (a, _) (b, _) ->
