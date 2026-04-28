@@ -21,7 +21,7 @@ let opt = function Some x -> [x] | None -> []
 %token <Cst.tok> IS MISSING PRESENT
 %token <Cst.tok> TRUE FALSE
 %token <Cst.tok> MIN MAX
-%token <Cst.tok> EG IE
+%token <Cst.tok> DEFAULT
 %token <Cst.tok> TEST GIVEN EXPECT
 %token <Cst.tok> ACTION INSTANCE ON PRIORITY INCLUDE DOMAIN
 %token <Cst.tok> PREDICATE SELF CASES ARROW
@@ -184,16 +184,28 @@ field:
   | dash=MINUS name=IDENT c=COLON body=field_body nl=NEWLINE n0=nls
     { mk Cst.NField $startpos $endpos
         ([g dash; g name; g c; body; g nl] @ gs n0) }
+  (* Derived-only shorthand: `- Name = formula`, no colon, no type. *)
+  | dash=MINUS name=IDENT eq=EQ e=expr nl=NEWLINE n0=nls
+    { let body = mk Cst.NFieldBody $startpos(eq) $endpos(e) [g eq; e] in
+      mk Cst.NField $startpos $endpos
+        ([g dash; g name; body; g nl] @ gs n0) }
 
+(* Field-body shapes:
+
+     - Field: <type>                     # raw, type only
+     - Field: <type> default <sample>    # raw with default
+     - Field default <sample>            # raw, type inferred
+     - Field = <expr>                    # derived from formula
+   *)
 field_body:
-  | eg=EG ex=example
-    { mk Cst.NFieldBody $startpos $endpos [g eg; ex] }
-  | ie=IE e=expr
-    { mk Cst.NFieldBody $startpos $endpos [g ie; e] }
   | t=ty_annot
     { mk Cst.NFieldBody $startpos $endpos [t] }
-  | t=ty_annot eg=EG ex=example
-    { mk Cst.NFieldBody $startpos $endpos [t; g eg; ex] }
+  | t=ty_annot dk=DEFAULT ex=example
+    { mk Cst.NFieldBody $startpos $endpos [t; g dk; ex] }
+  | dk=DEFAULT ex=example
+    { mk Cst.NFieldBody $startpos $endpos [g dk; ex] }
+  | eq=EQ e=expr
+    { mk Cst.NFieldBody $startpos $endpos [g eq; e] }
 
 example:
   | l=literal

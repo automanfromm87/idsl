@@ -135,7 +135,7 @@ let gen_field_name =
   let n = Printf.sprintf "%c%s" head tail in
   if Hashtbl.mem kw_set n then return "Foo" else return n
 
-(* A literal that's safe to use as an `e.g.` example. *)
+(* A literal that's safe to use as an `default` example. *)
 let gen_literal_text =
   Q.Gen.oneof [
     Q.Gen.return "0";
@@ -160,7 +160,7 @@ let gen_simple_program =
   let* fields = list_repeat (List.length field_names) gen_literal_text in
   let body =
     List.map2 (fun fn lit ->
-      Printf.sprintf "  - %s: e.g. %s" fn lit)
+      Printf.sprintf "  - %s: default %s" fn lit)
       field_names fields
     |> String.concat "\n"
   in

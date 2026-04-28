@@ -1,12 +1,12 @@
 let () =
   let s = {|schema A:
-  - X: e.g. 1
+  - X: default 1
 
 schema B:
   - Y: !!! broken !!!
 
 schema C:
-  - Z: e.g. 2
+  - Z: default 2
 |} in
   let prog, errs = IDSL.Driver.parse_with_recovery s in
   Printf.printf "Parsed %d top-level item(s):\n" (List.length prog);

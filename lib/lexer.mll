@@ -31,7 +31,7 @@ let is_keyword = function
   | "true" | "false" | "min" | "max" | "for"
   | "test" | "given" | "expect" | "action" | "instance"
   | "on" | "priority" | "include" | "domain"
-  | "predicate" | "self" | "cases" -> true
+  | "predicate" | "self" | "cases" | "default" -> true
   | _ -> false
 
 (* tokens after which a newline is treated as continuation *)
@@ -40,7 +40,7 @@ let is_continuation = function
   | EQEQ _ | NEQ _ | LT _ | GT _ | LEQ _ | GEQ _
   | COMMA _ | LPAREN _ | DOT _ | AT _
   | IF _ | THEN _ | ELSE _ | NOT _ | IS _ | IN _ | OF _ | WHERE _ | FOR _
-  | EG _ | IE _ | LBRACKET _ | COLON _ | LBRACE _ | EQ _
+  | DEFAULT _ | LBRACKET _ | COLON _ | LBRACE _ | EQ _
   | TEST _ | GIVEN _ | EXPECT _
   | ACTION _ | PIPE _ | INSTANCE _ | ON _ | PRIORITY _ | INCLUDE _
   | DOMAIN _ | PREDICATE _ | CASES _ | ARROW _
@@ -93,8 +93,6 @@ rule token = parse
       end else
         emit_log lexbuf Newline (fun t -> NEWLINE t)
     }
-  | "e.g." as t                 { emit_log lexbuf (EgIe t) (fun ct -> EG ct) }
-  | "i.e." as t                 { emit_log lexbuf (EgIe t) (fun ct -> IE ct) }
   | date as d                   { emit_log lexbuf (Date d) (fun ct -> DATE ct) }
   | money as m                  { emit_log lexbuf (Money m) (fun ct -> MONEY ct) }
   | float as f                  { emit_log lexbuf (Flt (float_of_string f)) (fun ct -> FLOAT ct) }
@@ -142,6 +140,7 @@ rule token = parse
           | "predicate" -> (fun ct -> PREDICATE ct)
           | "self"     -> (fun ct -> SELF ct)
           | "cases"    -> (fun ct -> CASES ct)
+          | "default"  -> (fun ct -> DEFAULT ct)
           | _ -> assert false
         in
         emit_log lexbuf (KW id) parser_tok_ctor

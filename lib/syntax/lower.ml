@@ -212,23 +212,39 @@ and lower_literal (t : Cst.tok) : literal =
 
 and lower_field (n : node) : field =
   let kids = significant n.nchildren in
+  let pos_of t = t.Cst.start in
   match kids with
+  (* `- Name : <body>` — full form *)
   | GTok _dash :: GTok name :: GTok _colon :: GNode body :: _ ->
-      let pos = name.start in
+      let pos = pos_of name in
       let body_kids = significant body.nchildren in
       (match body_kids with
-       | GTok ie :: [GNode e] when ie.kind = Cst.EgIe "i.e." ->
+       | [GTok eq; GNode e]
+         when eq.kind = Cst.Punct "=" && e.nkind = NExpr ->
+           FDerived (pos, tok_text name, lower_expr e)
+       | [GTok eq; GNode e] when eq.kind = Cst.Punct "=" ->
            FDerived (pos, tok_text name, lower_expr e)
        | _ ->
            FRaw (pos, tok_text name, lower_field_decl body_kids))
+  (* `- Name = formula` — derived shorthand, no colon *)
+  | [GTok _dash; GTok name; GNode body] ->
+      let pos = pos_of name in
+      let body_kids = significant body.nchildren in
+      (match body_kids with
+       | [GTok eq; GNode e] when eq.kind = Cst.Punct "=" ->
+           FDerived (pos, tok_text name, lower_expr e)
+       | _ -> err "derived shorthand body shape")
   | _ -> err "field shape unrecognised"
 
-(* Field-body shapes:
-     [ty]                          — type-only annotation
-     [ty; "e.g."; sample]          — type + sample
-     ["e.g."; sample]              — sample-only, type inferred *)
+(* Raw-field-body shapes:
+     [ty]                       — type-only annotation
+     [ty; "default"; sample]    — type + sample
+     ["default"; sample]        — sample-only, type inferred *)
 and lower_field_decl (kids : green list) : field_decl =
-  let is_eg = function GTok t -> t.kind = Cst.EgIe "e.g." | _ -> false in
+  let is_default = function
+    | GTok t -> (match t.kind with Cst.KW "default" -> true | _ -> false)
+    | _ -> false
+  in
   let lower_sample = function
     | GNode n when n.nkind = NExample -> lower_sample_node n
     | g -> lower_expr_g g
@@ -236,9 +252,9 @@ and lower_field_decl (kids : green list) : field_decl =
   match kids with
   | [GNode ty] when ty.nkind = NTyAnnot ->
       { fd_ty = Some (lower_ty_annot ty); fd_sample = None }
-  | [GNode ty; eg; sample] when ty.nkind = NTyAnnot && is_eg eg ->
+  | [GNode ty; dk; sample] when ty.nkind = NTyAnnot && is_default dk ->
       { fd_ty = Some (lower_ty_annot ty); fd_sample = Some (lower_sample sample) }
-  | [eg; sample] when is_eg eg ->
+  | [dk; sample] when is_default dk ->
       { fd_ty = None; fd_sample = Some (lower_sample sample) }
   | _ -> err "field body shape unrecognised"
 

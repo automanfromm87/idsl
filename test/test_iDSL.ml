@@ -59,30 +59,30 @@ let () =
 
   assert_ok "raw schema fields"
     {|schema C:
-  - ID: e.g. 123
+  - ID: default 123
   - Kind: {NDA, MSA, DPA}
-  - V: e.g. $5,000,000
-  - D: e.g. 2025-01-15
-  - B: e.g. true
+  - V: default $5,000,000
+  - D: default 2025-01-15
+  - B: default true
 |};
 
-  assert_tc_ok "type-only field annotation (no e.g.)"
+  assert_tc_ok "type-only field annotation (no default)"
     {|schema C:
   - Amount: Money
   - Kind:   {NDA, MSA}
   - Items:  [Int]
 |};
 
-  assert_tc_ok "type annotation + e.g. sample"
+  assert_tc_ok "type annotation + default sample"
     {|schema C:
-  - Amount: Money e.g. $50
-  - Kind:   {NDA, MSA} e.g. NDA
+  - Amount: Money default $50
+  - Kind:   {NDA, MSA} default NDA
 |};
 
   assert_tc_err "type annot rejects mismatched sample"
     "type mismatch"
     {|schema C:
-  - Amount: Money e.g. true
+  - Amount: Money default true
 |};
 
   assert_tc_ok "predicate decl + self call from derived field"
@@ -90,9 +90,27 @@ let () =
   Value > $1,000,000 and not IsRenewal
 
 schema Contract:
-  - Value: Money e.g. $500,000
-  - IsRenewal: e.g. true
-  - IsHighRisk: i.e. is_high_risk(self)
+  - Value: Money default $500,000
+  - IsRenewal: default true
+  - IsHighRisk = is_high_risk(self)
+|};
+
+  assert_tc_ok "implicit self: predicate without parens"
+    {|predicate is_high_risk on { Value: Money }: Value > $1,000,000
+
+schema Contract:
+  - Value: Money default $1
+  - IsHighRisk = is_high_risk
+|};
+
+  assert_tc_ok "implicit self: qualified predicate without parens"
+    {|domain core:
+  predicate is_high_risk on { V: Int }: V > 100
+
+domain shipping:
+  schema Order:
+    - V: Int default 1
+    - IsHigh = core.is_high_risk
 |};
 
   assert_tc_err "predicate rejects schema missing a required field"
@@ -101,8 +119,8 @@ schema Contract:
   Value > $1,000,000
 
 schema Amendment:
-  - Value: Money e.g. $1
-  - IsHighRisk: i.e. is_high_risk(self)
+  - Value: Money default $1
+  - IsHighRisk = is_high_risk(self)
 |};
 
   assert_tc_err "self inside predicate body errors"
@@ -128,7 +146,7 @@ predicate p on { X: Int }: notify("ops")
   (let src = {|@action flag(severity: {info, warn, alert}, reason: String)
 
 schema Order:
-  - Total: Money e.g. $1
+  - Total: Money default $1
 
 rule big_order on Order:
   when:
@@ -170,12 +188,12 @@ test "thresholds" on Order:
      type-annotation position. *)
   (let src = {|domain core:
   schema Money:
-    - Amount: Int e.g. 0
-    - Currency: {USD, EUR} e.g. USD
+    - Amount: Int default 0
+    - Currency: {USD, EUR} default USD
 
 domain shipping:
   schema Order:
-    - Total: core.Money e.g. {Amount: 50, Currency: USD}
+    - Total: core.Money default {Amount: 50, Currency: USD}
 |} in
    match parse src with
    | Error ds ->
@@ -194,7 +212,7 @@ domain shipping:
 
 domain shipping:
   schema Order:
-    - V: Int e.g. 1
+    - V: Int default 1
 
   rule big on Order:
     when:
@@ -225,13 +243,13 @@ domain shipping:
      instance declared in `core`, used inside a `shipping` schema. *)
   (let src = {|domain core:
   schema Party:
-    - Name: e.g. "x"
+    - Name: default "x"
   instance Party Alpha:
     Name = "Alpha"
 
 domain shipping:
   schema Order:
-    - P: core.Party e.g. core.Alpha
+    - P: core.Party default core.Alpha
 |} in
    match parse src with
    | Error ds ->
@@ -250,8 +268,8 @@ domain shipping:
 
 domain shipping:
   schema Order:
-    - V: Int e.g. 1
-    - Risk: i.e. core.is_high(self)
+    - V: Int default 1
+    - Risk = core.is_high(self)
 |} in
    match parse src with
    | Error ds ->
@@ -292,8 +310,8 @@ domain b:
   (let src = {|@action notify(team: String)
 
 schema Order:
-  - Cap: Money e.g. $1
-  - Required: Bool e.g. true
+  - Cap: Money default $1
+  - Required: Bool default true
 
 rule no_cap_when_required on Order:
   when:
@@ -370,9 +388,9 @@ predicate is_high_risk on { Value: Money, IsRenewal: Bool }:
   Value > $1,000,000 and not IsRenewal
 
 schema Contract:
-  - Value:      Money e.g. $1
-  - IsRenewal:  e.g. true
-  - IsHighRisk: i.e. is_high_risk(self)
+  - Value:      Money default $1
+  - IsRenewal:  default true
+  - IsHighRisk = is_high_risk(self)
 
 rule r on Contract:
   when:
@@ -418,21 +436,21 @@ test "predicate stays off on renewal":
 
   assert_resolve_ok "list literal of schema ref"
     {|schema Party:
-  - Name: e.g. "Alpha"
+  - Name: default "Alpha"
 schema Contract:
-  - Parties: e.g. [Party]
+  - Parties: default [Party]
 |};
 
   assert_resolve_err "unknown schema ref"
     {|schema Contract:
-  - Parties: e.g. [Party]
+  - Parties: default [Party]
 |};
 
   assert_ok "derived fields"
     {|schema C:
-  - DurationDays: e.g. 365
-  - IsLongTerm: i.e. DurationDays > 1825
-  - Retention: i.e. (if Kind == Financial then 3650 else 1825)
+  - DurationDays: default 365
+  - IsLongTerm = DurationDays > 1825
+  - Retention = (if Kind == Financial then 3650 else 1825)
 |};
 
   assert_ok "rule with dotted path and multiple predicates"
@@ -459,7 +477,7 @@ schema Contract:
 
   assert_ok "any/where with field access"
     {|schema C:
-  - Bad: i.e. any clause in Clauses where (clause.Kind == Indemnification
+  - Bad = any clause in Clauses where (clause.Kind == Indemnification
                                            and clause.Cap is missing)
 |};
 
@@ -472,7 +490,7 @@ schema Contract:
   assert_tc_ok "tc: well-typed schema + rule"
     {|schema C:
   - Kind: {NDA, MSA}
-  - IsLong: i.e. true
+  - IsLong = true
 rule r.x:
   when:
     Kind == NDA
@@ -493,7 +511,7 @@ rule r.x:
 
   assert_tc_err "tc: field access on non-object" "field access on non-object"
     {|schema C:
-  - Inner: i.e. true
+  - Inner = true
 rule r.x:
   when:
     Inner.NoSuch
@@ -503,16 +521,16 @@ rule r.x:
 
   assert_tc_err "tc: unknown field on schema" "no field"
     {|schema Sub:
-  - X: e.g. 1
+  - X: default 1
 schema C:
-  - Inner: e.g. [Sub]
-  - Bad: i.e. any s in Inner: s.NotThere == 1
+  - Inner: default [Sub]
+  - Bad = any s in Inner: s.NotThere == 1
 |};
 
   assert_tc_err "tc: bool + int" "+ requires"
     {|schema C:
-  - Flag: e.g. true
-  - Bad: i.e. Flag + 1
+  - Flag: default true
+  - Bad = Flag + 1
 |};
 
   assert_tc_err "tc: test assigns wrong-typed value" "type mismatch"

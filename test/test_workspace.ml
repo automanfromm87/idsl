@@ -77,9 +77,9 @@ let check_eq label ~expected ~actual =
 let test_multifile_include () =
   with_tmp_workspace (fun () ->
     let path_a = write_file ~name:"a.idsl"
-      ~content:"schema Inner:\n  - K: e.g. 1\n" in
+      ~content:"schema Inner:\n  - K: default 1\n" in
     let path_main = write_file ~name:"main.idsl"
-      ~content:"include \"a.idsl\"\n\nschema Outer:\n  - I: e.g. [Inner]\n" in
+      ~content:"include \"a.idsl\"\n\nschema Outer:\n  - I: default [Inner]\n" in
     let ws = Workspace.create () in
     let main_uri = "file://" ^ path_main in
     let a_uri    = "file://" ^ path_a in
@@ -104,9 +104,9 @@ let test_multifile_include () =
 let test_unsaved_cross_file_edit () =
   setup_tmpdir ();
   let path_a = write_file ~name:"a.idsl"
-    ~content:"schema Inner:\n  - K: e.g. 1\n" in
+    ~content:"schema Inner:\n  - K: default 1\n" in
   let path_main = write_file ~name:"main.idsl"
-    ~content:"include \"a.idsl\"\n\nschema Outer:\n  - I: e.g. [Inner]\n" in
+    ~content:"include \"a.idsl\"\n\nschema Outer:\n  - I: default [Inner]\n" in
 
   let ws = Workspace.create () in
   let main_uri = "file://" ^ path_main in
@@ -114,14 +114,14 @@ let test_unsaved_cross_file_edit () =
 
   (* First compile from disk to register the include edge. *)
   Workspace.put_doc ws ~uri:main_uri
-    ~content:"include \"a.idsl\"\n\nschema Outer:\n  - I: e.g. [Inner]\n"
+    ~content:"include \"a.idsl\"\n\nschema Outer:\n  - I: default [Inner]\n"
     ~version:1;
   let _ = Workspace.compile_doc ws ~uri:main_uri in
 
   (* Now open a.idsl in the editor with an unsaved extra field; the
      disk file still has just one. *)
   Workspace.put_doc ws ~uri:a_uri
-    ~content:"schema Inner:\n  - K: e.g. 1\n  - L: e.g. true\n"
+    ~content:"schema Inner:\n  - K: default 1\n  - L: default true\n"
     ~version:1;
   let _ = Workspace.invalidate ws ~uri:a_uri in
   let s = Workspace.compile_doc ws ~uri:main_uri in
@@ -145,10 +145,10 @@ let test_unsaved_cross_file_edit () =
    point compiles it. *)
 let test_named_instance_consistency () =
   let src = {|schema Party:
-  - Name: e.g. "Alpha"
+  - Name: default "Alpha"
 
 schema Contract:
-  - Parties: e.g. [Party]
+  - Parties: default [Party]
 
 instance Party Alpha:
   Name = "Alpha"
@@ -211,14 +211,14 @@ test "uses-instance":
 let test_cross_file_rename () =
   setup_tmpdir ();
   let path_a = write_file ~name:"a.idsl"
-    ~content:"schema Inner:\n  - K: e.g. 1\n" in
+    ~content:"schema Inner:\n  - K: default 1\n" in
   let path_main = write_file ~name:"main.idsl"
-    ~content:"include \"a.idsl\"\n\nschema Outer:\n  - Items: e.g. [Inner]\n" in
+    ~content:"include \"a.idsl\"\n\nschema Outer:\n  - Items: default [Inner]\n" in
 
   let ws = Workspace.create () in
   let main_uri = "file://" ^ path_main in
   Workspace.put_doc ws ~uri:main_uri
-    ~content:"include \"a.idsl\"\n\nschema Outer:\n  - Items: e.g. [Inner]\n"
+    ~content:"include \"a.idsl\"\n\nschema Outer:\n  - Items: default [Inner]\n"
     ~version:1;
   let s = Workspace.compile_doc ws ~uri:main_uri in
   let idx = match Session.index s with
@@ -261,10 +261,10 @@ let test_cross_file_rename () =
    per-call argument. *)
 let test_instance_resolver_isolation () =
   let src = {|schema Party:
-  - Name: e.g. "Alpha"
+  - Name: default "Alpha"
 
 schema Wrap:
-  - Inner: e.g. [Party]
+  - Inner: default [Party]
 
 instance Party Alpha:
   Name = "AlphaName"
@@ -320,25 +320,23 @@ instance Party Beta:
 let test_rename_records_pos_fname () =
   setup_tmpdir ();
   let path_a = write_file ~name:"a.idsl"
-    ~content:"schema Inner:\n  - K: e.g. 1\n" in
+    ~content:"schema Inner:\n  - K: default 1\n" in
   let path_main = write_file ~name:"main.idsl"
-    ~content:"include \"a.idsl\"\n\nschema Outer:\n  - I: e.g. [Inner]\n" in
+    ~content:"include \"a.idsl\"\n\nschema Outer:\n  - I: default [Inner]\n" in
   let ws = Workspace.create () in
   let main_uri = "file://" ^ path_main in
   Workspace.put_doc ws ~uri:main_uri
-    ~content:"include \"a.idsl\"\n\nschema Outer:\n  - I: e.g. [Inner]\n"
+    ~content:"include \"a.idsl\"\n\nschema Outer:\n  - I: default [Inner]\n"
     ~version:1;
   let s = Workspace.compile_doc ws ~uri:main_uri in
   let idx = match Session.index s with
     | Some i -> i | None -> failwith "no index" in
 
-  (* Click on the `Inner` use site in main.idsl line 3 col 14; the
-     symbol_at lookup matches it as a ref to schema Inner.  Rename to
-     "Foo" should yield two edits — one in a.idsl (decl) and one in
-     main.idsl (ref) — each tagged with the right pos_fname. *)
+  (* Click on the `Inner` use site in main.idsl line 3.  The line is
+     "  - I: default [Inner]" — `Inner` starts at col 16. *)
   let edits =
     match Lsp_query.rename_at idx
-            { line = 3; character = 14 } ~new_name:"Foo" with
+            { line = 3; character = 17 } ~new_name:"Foo" with
     | Some es -> es | None -> [] in
   check "[xrn] rename produced edits" (List.length edits >= 2);
   let by_basename = List.map (fun (e : Lsp_query.text_edit) ->
@@ -360,7 +358,7 @@ let test_call_item_records_pos_fname () =
     ~content:{|include "actions.idsl"
 
 schema Order:
-  - V: e.g. 1
+  - V: default 1
 
 rule R on Order:
   when:
@@ -402,19 +400,19 @@ rule R on Order:
 let test_rename_from_included_file () =
   setup_tmpdir ();
   let path_a = write_file ~name:"a.idsl"
-    ~content:"schema Inner:\n  - K: e.g. 1\n" in
+    ~content:"schema Inner:\n  - K: default 1\n" in
   let path_main = write_file ~name:"main.idsl"
-    ~content:"include \"a.idsl\"\n\nschema Outer:\n  - I: e.g. [Inner]\n" in
+    ~content:"include \"a.idsl\"\n\nschema Outer:\n  - I: default [Inner]\n" in
   let ws = Workspace.create () in
   let main_uri = "file://" ^ path_main in
   let a_uri    = "file://" ^ path_a in
 
   (* Open both and compile main first so the dep edge is registered. *)
   Workspace.put_doc ws ~uri:main_uri
-    ~content:"include \"a.idsl\"\n\nschema Outer:\n  - I: e.g. [Inner]\n"
+    ~content:"include \"a.idsl\"\n\nschema Outer:\n  - I: default [Inner]\n"
     ~version:1;
   Workspace.put_doc ws ~uri:a_uri
-    ~content:"schema Inner:\n  - K: e.g. 1\n"
+    ~content:"schema Inner:\n  - K: default 1\n"
     ~version:1;
   let _ = Workspace.compile_doc ws ~uri:main_uri in
 
@@ -449,9 +447,9 @@ let test_rename_from_included_file () =
 let test_folder_scan_includes_closed_files () =
   setup_tmpdir ();
   let path_a = write_file ~name:"a.idsl"
-    ~content:"schema OnlyOnDisk:\n  - K: e.g. 1\n" in
+    ~content:"schema OnlyOnDisk:\n  - K: default 1\n" in
   let path_b = write_file ~name:"b.idsl"
-    ~content:"schema AlsoOnDisk:\n  - X: e.g. true\n" in
+    ~content:"schema AlsoOnDisk:\n  - X: default true\n" in
 
   let ws = Workspace.create () in
   Workspace.set_folders ws ["file://" ^ !tmpdir];
@@ -493,11 +491,11 @@ let test_folder_scan_includes_closed_files () =
 let test_rename_two_hop_includes () =
   setup_tmpdir ();
   let path_a = write_file ~name:"a.idsl"
-    ~content:"schema Inner:\n  - K: e.g. 1\n" in
+    ~content:"schema Inner:\n  - K: default 1\n" in
   let path_b = write_file ~name:"b.idsl"
-    ~content:"include \"a.idsl\"\n\nschema Mid:\n  - X: e.g. [Inner]\n" in
+    ~content:"include \"a.idsl\"\n\nschema Mid:\n  - X: default [Inner]\n" in
   let path_main = write_file ~name:"main.idsl"
-    ~content:"include \"b.idsl\"\n\nschema Top:\n  - Y: e.g. [Inner]\n" in
+    ~content:"include \"b.idsl\"\n\nschema Top:\n  - Y: default [Inner]\n" in
   let ws = Workspace.create () in
   let main_uri = "file://" ^ path_main in
   let b_uri    = "file://" ^ path_b in
@@ -533,9 +531,9 @@ let test_rename_two_hop_includes () =
 let test_document_symbol_only_local_file () =
   setup_tmpdir ();
   let path_a = write_file ~name:"a.idsl"
-    ~content:"schema Inner:\n  - K: e.g. 1\n" in
+    ~content:"schema Inner:\n  - K: default 1\n" in
   let path_main = write_file ~name:"main.idsl"
-    ~content:"include \"a.idsl\"\n\nschema Outer:\n  - I: e.g. [Inner]\n" in
+    ~content:"include \"a.idsl\"\n\nschema Outer:\n  - I: default [Inner]\n" in
   let ws = Workspace.create () in
   let main_uri = "file://" ^ path_main in
   Workspace.put_doc ws ~uri:main_uri ~content:(read_file path_main) ~version:1;
@@ -569,11 +567,11 @@ let test_document_symbol_only_local_file () =
 let test_domain_scopes_same_name () =
   let src = {|domain shipping:
   schema Item:
-    - X: e.g. 1
+    - X: default 1
 
 domain billing:
   schema Item:
-    - Y: e.g. true
+    - Y: default true
 |} in
   let s = IDSL.Session.compile_string src in
   check "[dom] same-name schemas in two domains compile"
@@ -596,11 +594,11 @@ domain billing:
 let test_domain_blocks_cross_reference () =
   let src = {|domain shipping:
   schema Item:
-    - X: e.g. 1
+    - X: default 1
 
 domain billing:
   schema Invoice:
-    - Lines: e.g. [Item]   (* should fail — Item is in shipping *)
+    - Lines: default [Item]   (* should fail — Item is in shipping *)
 |} in
   let s = IDSL.Session.compile_string src in
   check "[dom-x] cross-domain reference is rejected"
@@ -621,30 +619,30 @@ domain billing:
 let test_versioned_put_doc () =
   let ws = Workspace.create () in
   let uri = "file:///tmp/v_test.idsl" in
-  (match Workspace.put_doc_versioned ws ~uri ~content:"schema A:\n  - K: e.g. 1\n"
+  (match Workspace.put_doc_versioned ws ~uri ~content:"schema A:\n  - K: default 1\n"
            ~version:1 with
    | `Updated -> check "[ver] initial put accepted" true
    | `Stale _ -> check "[ver] initial put accepted" false);
 
   (* Newer version overwrites. *)
-  (match Workspace.put_doc_versioned ws ~uri ~content:"schema B:\n  - K: e.g. 1\n"
+  (match Workspace.put_doc_versioned ws ~uri ~content:"schema B:\n  - K: default 1\n"
            ~version:5 with
    | `Updated -> check "[ver] newer put accepted" true
    | `Stale _ -> check "[ver] newer put accepted" false);
   let cur1 = match Workspace.get_doc ws ~uri with
     | Some d -> d.content | None -> "" in
   check "[ver] doc holds the v=5 content"
-    (cur1 = "schema B:\n  - K: e.g. 1\n");
+    (cur1 = "schema B:\n  - K: default 1\n");
 
   (* Stale (older) version is dropped. *)
-  (match Workspace.put_doc_versioned ws ~uri ~content:"schema STALE:\n  - K: e.g. 1\n"
+  (match Workspace.put_doc_versioned ws ~uri ~content:"schema STALE:\n  - K: default 1\n"
            ~version:2 with
    | `Stale n -> check "[ver] stale put rejected (current=5)" (n = 5)
    | `Updated -> check "[ver] stale put rejected" false);
   let cur2 = match Workspace.get_doc ws ~uri with
     | Some d -> d.content | None -> "" in
   check "[ver] stale put did not overwrite"
-    (cur2 = "schema B:\n  - K: e.g. 1\n");
+    (cur2 = "schema B:\n  - K: default 1\n");
 
   (* Empty content at a newer version is a *legitimate* edit
      (regression: the bin used to skip empty `updated`). *)
@@ -667,7 +665,7 @@ let test_remove_hook_fires () =
   let removed = ref [] in
   Workspace.on_remove ws (fun ~uri -> removed := uri :: !removed);
   let uri = "file:///tmp/hook_test.idsl" in
-  Workspace.put_doc ws ~uri ~content:"schema A:\n  - K: e.g. 1\n" ~version:1;
+  Workspace.put_doc ws ~uri ~content:"schema A:\n  - K: default 1\n" ~version:1;
   let _ = Workspace.compile_doc ws ~uri in
   Workspace.remove_doc ws ~uri;
   check "[hook] on_remove fired with the closed URI"
@@ -691,9 +689,9 @@ let test_remove_hook_fires () =
 let test_watched_delete_preserves_open_docs () =
   setup_tmpdir ();
   let path_a = write_file ~name:"a.idsl"
-    ~content:"schema Inner:\n  - K: e.g. 1\n" in
+    ~content:"schema Inner:\n  - K: default 1\n" in
   let path_main = write_file ~name:"main.idsl"
-    ~content:"include \"a.idsl\"\n\nschema Outer:\n  - I: e.g. [Inner]\n" in
+    ~content:"include \"a.idsl\"\n\nschema Outer:\n  - I: default [Inner]\n" in
   let ws = Workspace.create () in
   let main_uri = "file://" ^ path_main in
   let a_uri    = "file://" ^ path_a in
@@ -715,9 +713,9 @@ let test_watched_delete_preserves_open_docs () =
 let test_watched_delete_unopened_notifies_dependents () =
   setup_tmpdir ();
   let path_a = write_file ~name:"a.idsl"
-    ~content:"schema Inner:\n  - K: e.g. 1\n" in
+    ~content:"schema Inner:\n  - K: default 1\n" in
   let path_main = write_file ~name:"main.idsl"
-    ~content:"include \"a.idsl\"\n\nschema Outer:\n  - I: e.g. [Inner]\n" in
+    ~content:"include \"a.idsl\"\n\nschema Outer:\n  - I: default [Inner]\n" in
   let ws = Workspace.create () in
   let main_uri = "file://" ^ path_main in
   let a_uri    = "file://" ^ path_a in
@@ -901,9 +899,9 @@ let test_symlink_cycle () =
   let inner = Filename.concat outer "sub" in
   Unix.mkdir inner 0o755;
   let _ = write_file ~name:"a.idsl"
-    ~content:"schema A:\n  - K: e.g. 1\n" in
+    ~content:"schema A:\n  - K: default 1\n" in
   let _ = write_file ~name:"sub/b.idsl"
-    ~content:"schema B:\n  - K: e.g. 1\n" in
+    ~content:"schema B:\n  - K: default 1\n" in
   (* Create a self-referential symlink: sub/loop -> ../sub *)
   Unix.symlink "../sub" (Filename.concat inner "loop");
 
@@ -930,7 +928,7 @@ let test_symlink_cycle () =
 let test_drop_closed_doc_cache () =
   setup_tmpdir ();
   let path_a = write_file ~name:"a.idsl"
-    ~content:"schema Old:\n  - K: e.g. 1\n" in
+    ~content:"schema Old:\n  - K: default 1\n" in
   let ws = Workspace.create () in
   let a_uri = "file://" ^ path_a in
 
@@ -946,7 +944,7 @@ let test_drop_closed_doc_cache () =
   (* Disk changes while watcher would normally tell us; simulate the
      watcher being unavailable by *not* invalidating manually. *)
   let oc = open_out path_a in
-  output_string oc "schema New:\n  - K: e.g. 1\n";
+  output_string oc "schema New:\n  - K: default 1\n";
   close_out oc;
 
   (* Without intervention, compile_doc returns the cached Old session. *)
@@ -970,10 +968,10 @@ let test_drop_closed_doc_cache () =
 
   (* Open docs are *not* dropped — their in-memory text is authoritative. *)
   let path_b = write_file ~name:"b.idsl"
-    ~content:"schema OnDisk:\n  - K: e.g. 1\n" in
+    ~content:"schema OnDisk:\n  - K: default 1\n" in
   let b_uri = "file://" ^ path_b in
   Workspace.put_doc ws ~uri:b_uri
-    ~content:"schema InMem:\n  - K: e.g. 1\n" ~version:1;
+    ~content:"schema InMem:\n  - K: default 1\n" ~version:1;
   let _ = Workspace.compile_doc ws ~uri:b_uri in
   Workspace.drop_closed_doc_cache ws;
   let s4 = Workspace.compile_doc ws ~uri:b_uri in
@@ -995,9 +993,9 @@ let test_drop_closed_doc_cache () =
 let test_didclose_invalidates_dependents () =
   setup_tmpdir ();
   let path_a = write_file ~name:"a.idsl"
-    ~content:"schema OnDisk:\n  - K: e.g. 1\n" in
+    ~content:"schema OnDisk:\n  - K: default 1\n" in
   let path_main = write_file ~name:"main.idsl"
-    ~content:"include \"a.idsl\"\n\nschema Outer:\n  - I: e.g. [OnDisk]\n" in
+    ~content:"include \"a.idsl\"\n\nschema Outer:\n  - I: default [OnDisk]\n" in
   let ws = Workspace.create () in
   let a_uri    = "file://" ^ path_a in
   let main_uri = "file://" ^ path_main in
@@ -1005,10 +1003,10 @@ let test_didclose_invalidates_dependents () =
   (* Both open. a.idsl's in-memory content renames the schema. main's
      compile resolves [InMem] against the in-memory a.idsl. *)
   Workspace.put_doc ws ~uri:main_uri
-    ~content:"include \"a.idsl\"\n\nschema Outer:\n  - I: e.g. [InMem]\n"
+    ~content:"include \"a.idsl\"\n\nschema Outer:\n  - I: default [InMem]\n"
     ~version:1;
   Workspace.put_doc ws ~uri:a_uri
-    ~content:"schema InMem:\n  - K: e.g. 1\n" ~version:1;
+    ~content:"schema InMem:\n  - K: default 1\n" ~version:1;
   let s_pre = Workspace.compile_doc ws ~uri:main_uri in
   check "[close] main compiles cleanly against in-memory a.idsl"
     (s_pre.diagnostics = []);
@@ -1036,7 +1034,7 @@ let test_didclose_invalidates_dependents () =
 let test_canonical_uri_keying () =
   setup_tmpdir ();
   let path = write_file ~name:"shared.idsl"
-    ~content:"schema A:\n  - K: e.g. 1\n" in
+    ~content:"schema A:\n  - K: default 1\n" in
   let ws = Workspace.create () in
   let plain     = "file://"          ^ path in
   let localhost = "file://localhost" ^ path in
@@ -1095,13 +1093,13 @@ let test_workspace_folder_canon () =
 (* ---------- Test 25: UTF-16 column on a non-ASCII line --------------
 
    Diagnostics / hints / outline ranges must use UTF-16 columns —
-   i.e. a 4-byte UTF-8 character emits as 2 UTF-16 code units, and
+   = a 4-byte UTF-8 character emits as 2 UTF-16 code units, and
    any column-after-it must reflect that.  The bin's wire writers
    route every range through `utf16_pos_to_json ~src`, so this test
    pins down the underlying conversion the writers depend on. *)
 let test_utf16_column_on_non_ascii () =
   (* Line with a 3-byte UTF-8 char (例 = U+4F8B = ascii=1 BMP code unit). *)
-  let src = "schema 例:\n  - K: e.g. 1\n" in
+  let src = "schema 例:\n  - K: default 1\n" in
   let line = IDSL.Utf16.line_of_source src 0 in
   let byte_col_after = String.index src ':' in
   let utf16_col = IDSL.Utf16.utf16_of_byte_col line byte_col_after in
@@ -1137,7 +1135,7 @@ let test_last_good_canonical_keying () =
          same internal session; at minimum the server must not crash
          and must answer the request. *)
       let did_open = frame
-        {|{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file://localhost/tmp/x.idsl","languageId":"idsl","version":1,"text":"schema A:\n  - K: e.g. 1\n"}}}|} in
+        {|{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file://localhost/tmp/x.idsl","languageId":"idsl","version":1,"text":"schema A:\n  - K: default 1\n"}}}|} in
       let doc_sym = frame
         {|{"jsonrpc":"2.0","id":7,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":"file:///tmp/x.idsl"}}}|} in
       let input = init_msg ^ did_open ^ doc_sym ^ exit_msg in

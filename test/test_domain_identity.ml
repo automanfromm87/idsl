@@ -41,9 +41,9 @@ let check label cond =
 
 let src_runtime = {|domain shipping:
   schema Item:
-    - Weight: e.g. 1
+    - Weight: default 1
   schema Order:
-    - Items: e.g. [Item]
+    - Items: default [Item]
 
   @action ship(w: Int)
 
@@ -61,7 +61,7 @@ let src_runtime = {|domain shipping:
 
 domain billing:
   schema Item:
-    - Price: e.g. 1
+    - Price: default 1
 |}
 
 let test_runtime_identity_across_domains () =
@@ -80,13 +80,13 @@ let test_runtime_identity_across_domains () =
 let test_instance_identity_across_domains () =
   let src = {|domain a:
   schema P:
-    - K: e.g. 1
+    - K: default 1
   instance P I:
     K = 7
 
 domain b:
   schema P:
-    - K: e.g. 1
+    - K: default 1
   instance P I:
     K = 99
 |} in
@@ -106,7 +106,7 @@ domain b:
 let test_document_symbol_range_is_bare_token () =
   let src = {|domain shipping:
   schema Item:
-    - K: e.g. 1
+    - K: default 1
 |} in
   let s = Session.compile_string src in
   let idx = match Session.index s with
@@ -126,7 +126,7 @@ let test_document_symbol_range_is_bare_token () =
 (* ---- 4: rename / goto resolve the qualified symbol via the bare token ---- *)
 
 let test_rename_resolves_through_domain () =
-  let src = "domain shipping:\n  schema Item:\n    - K: e.g. 1\n" in
+  let src = "domain shipping:\n  schema Item:\n    - K: default 1\n" in
   let s = Session.compile_string src in
   let idx = match Session.index s with
     | Some i -> i | None -> failwith "no index" in
@@ -150,8 +150,8 @@ let test_rename_resolves_through_domain () =
 (* ---- 5: parser is reentrant (concurrent / nested parses don't collide) ---- *)
 
 let test_parser_is_reentrant () =
-  let s1 = "schema A:\n  - X: e.g. 1\n" in
-  let s2 = "schema B:\n  - Y: e.g. true\n" in
+  let s1 = "schema A:\n  - X: default 1\n" in
+  let s2 = "schema B:\n  - Y: default true\n" in
   let r1 = Driver.parse_string s1 in
   let _r2 = Driver.parse_string s2 in
   (* After a second parse, r1's token list should still contain `A`,
@@ -170,7 +170,7 @@ let test_parser_is_reentrant () =
 let test_parser_concurrent_safety () =
   let n = 16 in
   let make i =
-    Printf.sprintf "schema S%d:\n  - F%d: e.g. %d\n" i i i
+    Printf.sprintf "schema S%d:\n  - F%d: default %d\n" i i i
   in
   let outputs = Array.make n None in
   let threads = Array.init n (fun i ->

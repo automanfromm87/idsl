@@ -149,25 +149,36 @@ let rec infer env e : texpr =
       (match resolve_var env id with
        | Some (v, t) -> mk (TVar v) t
        | None ->
-         let ty = match scoped_find_canon env.schemas env id with
-           | Some (canon, _) -> TSchema canon
-           | None            -> TTag id
-         in
-         mk (TVar (VarTag id)) ty)
-  | EField ({ e_node = EVar dom_name; e_pos = dom_pos; _ }, _, f)
+         (* Bare predicate reference — `is_high_risk` with no
+            explicit `(self)`.  Allowed only inside a schema context;
+            implicitly applies the predicate to `self`. *)
+         (match scoped_find_canon env.predicates env id with
+          | Some (canon, ps) when env.current_schema <> None ->
+              check_predicate_args ~env ~name:id ~canon ~ps
+                ~self_fields:env.fields ~explicit_arg:None ~mk
+          | _ ->
+              let ty = match scoped_find_canon env.schemas env id with
+                | Some (canon, _) -> TSchema canon
+                | None            -> TTag id
+              in
+              mk (TVar (VarTag id)) ty))
+  | EField ({ e_node = EVar dom_name; _ }, _, f)
     when is_domain env dom_name ->
-      (* `core.Money` etc. The first segment is a known domain; the
-         whole expression denotes a qualified schema / instance /
-         predicate / action — never a field access. *)
       let qkey = dom_name ^ "." ^ f in
-      ignore dom_pos;
       (match Hashtbl.find_opt env.instances qkey with
        | Some sname -> mk (TVar (VarInstance qkey)) (TSchema sname)
-       | None ->
-           if Hashtbl.mem env.schemas qkey
-           then mk (TVar (VarTag qkey)) (TSchema qkey)
-           else err "%sunknown qualified reference `%s.%s`"
-                  (Printf.sprintf "%s: " (pp_pos e.e_pos)) dom_name f)
+       | None when Hashtbl.mem env.schemas qkey ->
+           mk (TVar (VarTag qkey)) (TSchema qkey)
+       | None when Hashtbl.mem env.predicates qkey
+                && env.current_schema <> None ->
+           (* `legal.is_high_risk` — qualified predicate ref with no
+              parens.  Implicit-self call. *)
+           let ps = Hashtbl.find env.predicates qkey in
+           check_predicate_args ~env ~name:f ~canon:qkey ~ps
+             ~self_fields:env.fields ~explicit_arg:None ~mk
+       | _ ->
+           err "%sunknown qualified reference `%s.%s`"
+             (Printf.sprintf "%s: " (pp_pos e.e_pos)) dom_name f)
   | EField (obj, fpos, f) ->
       let to_ = infer env obj in
       let fty = field_type ~pos:e.e_pos env to_.ty f in
@@ -226,14 +237,6 @@ let rec infer env e : texpr =
       then mk (TCall (name, [ta; tb])) (arith_result ta.ty tb.ty)
       else err "%s requires numeric operands" name
   | ECall (name, args) ->
-      (* Predicate call: `is_high_risk(self)`. The signature is a
-         structural record type; the single argument must expose every
-         declared (field, type) pair of the predicate's signature.
-
-         Predicate bodies themselves are restricted: no nested
-         predicate calls, no action calls. Both rules are enforced
-         here — predicates dispatch via this branch, and actions land
-         in `function not allowed in expression context` below. *)
       if env.in_predicate_body
          && (Hashtbl.mem env.predicates name
              || (match env.current_domain with
@@ -250,32 +253,54 @@ let rec infer env e : texpr =
        | None ->
            err "function `%s` not allowed in expression context" name
        | Some (canon, ps) ->
-           if List.length args <> 1 then
-             err "predicate %s expects 1 argument, got %d"
-               name (List.length args);
-           let arg = List.hd args in
-           let ta = infer env arg in
-           let arg_fields = match ta.ty with
-             | TObject kvs -> kvs
-             | TSchema s ->
-                 (match scoped_find env.schemas env s with
-                  | Some ts -> ts.ts_types
-                  | None    -> err "predicate %s: unknown schema %s for argument" name s)
-             | TAny -> []
-             | _ -> err "predicate %s expects an object/schema argument, got %s"
-                      name (pp_ty ta.ty)
+           let explicit_arg = match args with
+             | [a]  -> Some a
+             | []   -> None
+             | _    -> err "predicate %s expects at most 1 argument, got %d"
+                         name (List.length args)
            in
-           List.iter (fun (k, expected) ->
-             match List.assoc_opt k arg_fields with
-             | None ->
-                 err "predicate %s: argument missing field `%s : %s`"
-                   name k (pp_ty expected)
-             | Some actual ->
-                 (try ignore (unify expected actual)
-                  with Type_error m ->
-                    err "predicate %s field `%s`: %s" name k m))
-             ps.ps_params;
-           mk (TCall (canon, [ta])) TBool)
+           check_predicate_args ~env ~name ~canon ~ps
+             ~self_fields:env.fields ~explicit_arg ~mk)
+
+(* Shared core for predicate-call typing.  Two entry points:
+     - explicit:  `is_high_risk(self)` (or any other expr argument)
+     - implicit:  `is_high_risk` (no parens) inside a schema context;
+                  the predicate auto-applies to `self`.
+   Both paths verify the argument structurally satisfies the
+   predicate's signature, then emit `TCall(canon, [arg])` typed
+   `Bool`. *)
+and check_predicate_args ~env ~name ~canon ~ps ~self_fields
+    ~explicit_arg ~mk =
+  let arg_te = match explicit_arg with
+    | Some arg -> infer env arg
+    | None ->
+        if self_fields = [] || env.current_schema = None then
+          err "implicit predicate call `%s` requires a schema context" name;
+        { node = TSelf self_fields;
+          ty   = TObject self_fields;
+          pos  = Lexing.dummy_pos }
+  in
+  let arg_fields = match arg_te.ty with
+    | TObject kvs -> kvs
+    | TSchema s ->
+        (match scoped_find env.schemas env s with
+         | Some ts -> ts.ts_types
+         | None    -> err "predicate %s: unknown schema %s for argument" name s)
+    | TAny -> []
+    | _ -> err "predicate %s expects an object/schema argument, got %s"
+             name (pp_ty arg_te.ty)
+  in
+  List.iter (fun (k, expected) ->
+    match List.assoc_opt k arg_fields with
+    | None ->
+        err "predicate %s: argument missing field `%s : %s`"
+          name k (pp_ty expected)
+    | Some actual ->
+        (try ignore (unify expected actual)
+         with Type_error m ->
+           err "predicate %s field `%s`: %s" name k m))
+    ps.ps_params;
+  mk (TCall (canon, [arg_te])) TBool
 
 and field_type ?pos env ot f =
   let prefix = match pos with

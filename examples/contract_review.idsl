@@ -22,21 +22,21 @@
 
 domain core:
   schema Counterparty:
-    - Name:         e.g. "Acme Corp"
+    - Name:         default "Acme Corp"
     - Jurisdiction: {US, EU, UK, JP, CN}
-    - IsRegulated:  Bool e.g. false
+    - IsRegulated:  Bool default false
 
   # `LiabilityCap` deliberately has no sample — it's optional, and
   # legal rules below treat its absence as "unbounded exposure".
   schema Contract:
-    - ID:            e.g. "MSA-2025-001"
+    - ID:            default "MSA-2025-001"
     - Kind:          {MSA, NDA, DPA, SOW}
-    - Counterparty:  core.Counterparty e.g. core.AcmeUS
-    - Value:         Money e.g. $1
+    - Counterparty:  core.Counterparty default core.AcmeUS
+    - Value:         Money default $1
     - LiabilityCap:  Money
-    - SignedDate:    Date e.g. 2025-01-01
-    - TermYears:     Int e.g. 1
-    - Renewal:       {Auto, Manual} e.g. Manual
+    - SignedDate:    Date default 2025-01-01
+    - TermYears:     Int default 1
+    - Renewal:       {Auto, Manual} default Manual
 
   # Reusable counterparty fixtures — tests reference them by
   # `core.AcmeUS` style.
@@ -91,7 +91,7 @@ domain legal:
   rule legal.review.high_value on core.Contract priority 10:
     """High-dollar contracts need senior counsel before signature."""
     when:
-      legal.is_high_value(self)
+      legal.is_high_value             # implicit self — read it as a property
     then:
       legal.require_signoff("senior_counsel")
       legal.flag(warn, "high-value contract")
@@ -99,13 +99,13 @@ domain legal:
   # Three-valued logic in action: `LiabilityCap is missing` is the
   # *explicit* probe.  Writing `not (LiabilityCap > $0)` would
   # silently fail to fire on missing — `not missing` is `missing`,
-  # not `true`.
+  # not `true`.  See docs/three_valued_logic.md.
   rule legal.review.uncapped on core.Contract priority 8:
     """Liability cap absent on a non-trivial contract is unbounded
     exposure — escalate."""
     when:
       Value > $100,000
-      legal.is_uncapped(self)
+      legal.is_uncapped
     then:
       legal.require_signoff("general_counsel")
       legal.flag(alert, "uncapped liability")
@@ -114,7 +114,7 @@ domain legal:
     """Auto-renewing multi-year deals quietly extend exposure;
     surface them so calendar reminders get set."""
     when:
-      legal.is_long_term(self)
+      legal.is_long_term
       Renewal == Auto
     then:
       legal.flag(warn, "long-term auto-renewal — set reminder")
