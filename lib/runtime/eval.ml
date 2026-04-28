@@ -234,6 +234,12 @@ type test_result = {
 
 let pred_true = function VBool true -> true | _ -> false
 
+let observed_value = function
+  | VBool true  -> `True
+  | VBool false -> `False
+  | VMissing    -> `Missing
+  | _           -> `False  (* non-bool defaults to false for coverage *)
+
 let rec eval env (e : texpr) =
   match e.node with
   | TLit l    -> lit_to_value l
@@ -263,14 +269,23 @@ let rec eval env (e : texpr) =
        | v -> err "field access on non-object: %s.%s" (show_value v) f)
   | TList tes    -> VList (List.map (eval env) tes)
   | TObject kvs  -> VObject (List.map (fun (k, v) -> (k, eval env v)) kvs)
-  | TUnary (op, e) -> eval_unop op (eval env e)
+  | TUnary (Ast.Not as op, sub) ->
+      let v = eval env sub in
+      Coverage.observe e.pos ~value:(observed_value v);
+      eval_unop op v
+  | TUnary (op, sub) -> eval_unop op (eval env sub)
+  | TBin ((Ast.And | Ast.Or) as op, a, b) ->
+      let r = eval_binop op (eval env a) (eval env b) in
+      Coverage.observe e.pos ~value:(observed_value r);
+      r
   | TBin (op, a, b) -> eval_binop op (eval env a) (eval env b)
   | TIf (c, t, el) ->
-      (match eval env c with
+      let cv = eval env c in
+      Coverage.observe e.pos ~value:(observed_value cv);
+      (match cv with
        | VBool true  -> eval env t
        | VBool false -> eval env el
-       | VMissing    -> VMissing       (* three-valued: missing
-                                          condition picks no branch *)
+       | VMissing    -> VMissing
        | v -> err "if condition not bool: %s" (show_value v))
   | TAny (x, y, p) ->
       with_list env y (VBool false) (fun items ->
@@ -291,10 +306,16 @@ let rec eval env (e : texpr) =
           if pred_true (eval env' p) then
             match to_num (eval env' f) with Some v -> n +. v | None -> n
           else n) 0.0 items))
-  | TIsMissing e ->
-      (match eval env e with VMissing -> VBool true  | _ -> VBool false)
-  | TIsPresent e ->
-      (match eval env e with VMissing -> VBool false | _ -> VBool true)
+  | TIsMissing sub ->
+      let v = eval env sub in
+      let r = match v with VMissing -> true | _ -> false in
+      Coverage.observe e.pos ~value:(if r then `True else `False);
+      VBool r
+  | TIsPresent sub ->
+      let v = eval env sub in
+      let r = match v with VMissing -> false | _ -> true in
+      Coverage.observe e.pos ~value:(if r then `True else `False);
+      VBool r
   | TCall (("min" | "max") as name, [a; b]) ->
       let va = eval env a and vb = eval env b in
       (match to_num va, to_num vb with
@@ -417,6 +438,16 @@ let make_ctx (tp : tprogram) =
 
 let derived_of = Typed.derived_fields
 
+(* Fill in raw fields missing from the user's bindings with the
+   schema's `default` expressions, so `default $1` actually delivers
+   the fallback its keyword promises. Defaults are only consulted for
+   field names the user did not explicitly bind — explicit bindings
+   always win. *)
+let apply_defaults sch env explicit_keys =
+  List.fold_left (fun e (n, te) ->
+    if List.mem n explicit_keys then e
+    else bind e n (eval e te)) env sch.ts_defaults
+
 let build_env ctx (g : tgiven) =
   let sch =
     match Hashtbl.find_opt ctx.schemas g.tg_schema with
@@ -427,8 +458,10 @@ let build_env ctx (g : tgiven) =
                predicates = ctx.predicates } in
   let env_raw =
     List.fold_left (fun e (k, v) -> bind e k (eval e v)) env0 g.tg_values in
+  let explicit = List.map fst g.tg_values in
+  let env_with_defaults = apply_defaults sch env_raw explicit in
   List.fold_left (fun e (n, te) -> bind e n (eval e te))
-    env_raw (derived_of sch)
+    env_with_defaults (derived_of sch)
 
 (* Build an env from (field name → already-evaluated value) pairs and a
    schema. Used by Load when reading JSON inputs at runtime. *)
@@ -438,8 +471,10 @@ let build_env_from_values ?(instances = Hashtbl.create 0)
   let env0 = { empty_env with instances; predicates } in
   let env_raw =
     List.fold_left (fun e (k, v) -> bind e k v) env0 raw_pairs in
+  let explicit = List.map fst raw_pairs in
+  let env_with_defaults = apply_defaults sch env_raw explicit in
   List.fold_left (fun e (n, te) -> bind e n (eval e te))
-    env_raw (derived_of sch)
+    env_with_defaults (derived_of sch)
 
 (* ---------- run rules → outcomes ---------- *)
 

@@ -50,12 +50,17 @@ type tfield =
    otherwise. `ts_bare` is preserved separately so range / hover code
    can recover the source-token text without re-parsing the qualified
    string. `ts_domain` is the lexical domain (None = top-level). *)
+(* `ts_defaults` holds the typed default expressions for each raw
+   field that declared one. Filled in by build_env when a test's
+   given block / a JSON input doesn't bind the field — making
+   `default` actually deliver the fallback its keyword promises. *)
 type tschema = {
-  ts_name   : ident;
-  ts_bare   : ident;
-  ts_domain : ident option;
-  ts_fields : tfield list;
-  ts_types  : (ident * Types.ty) list;
+  ts_name     : ident;
+  ts_bare     : ident;
+  ts_domain   : ident option;
+  ts_fields   : tfield list;
+  ts_types    : (ident * Types.ty) list;
+  ts_defaults : (ident * texpr) list;
 }
 
 (* Position is the call name token; lets the index point goto/refs/rename

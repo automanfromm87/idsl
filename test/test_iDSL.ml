@@ -303,6 +303,148 @@ domain b:
     - K2: {Active, Pending}
 |};
 
+  (* @module + @module_version: declaring a module name auto-wraps
+     all top-level domainless decls under that name, so `include`d
+     files end up properly namespaced without manual `domain` blocks. *)
+  (let src = {|@module("legal_review")
+@module_version("0.2.0")
+
+@action notify(team: String)
+
+schema Contract:
+  - V: Money default $1
+
+rule big on Contract:
+  when:
+    V > $0
+  then:
+    notify("ops")
+|} in
+   match parse src with
+   | Error ds -> Printf.printf "FAIL module: parse %s\n" (pp_diags ds); exit 1
+   | Ok p ->
+       (match IDSL.Typecheck.run p with
+        | Error ds ->
+            Printf.printf "FAIL module: tc %s\n" (pp_diags ds); exit 1
+        | Ok tp ->
+            let schema_qname =
+              match tp.schemas with
+              | [s] -> s.IDSL.Typed.ts_name
+              | _ -> "??" in
+            let action_qname =
+              match tp.actions with
+              | [a] -> a.IDSL.Typed.ta_name
+              | _ -> "??" in
+            if schema_qname = "legal_review.Contract"
+            && action_qname = "legal_review.notify"
+            then Printf.printf "ok   @module auto-wraps domainless decls\n"
+            else (Printf.printf "FAIL module: schema=%s action=%s\n"
+                    schema_qname action_qname; exit 1)));
+
+  assert_tc_err "@module rejects non-ident name"
+    "expected an identifier-shaped name"
+    {|@module("not a name")
+schema A:
+  - K: Int default 0
+|};
+
+  assert_tc_err "@module_version rejects non-semver"
+    "expected semver"
+    {|@module("foo")
+@module_version("1")
+schema A:
+  - K: Int default 0
+|};
+
+  (* Branch coverage: track that conditional sites were exercised
+     in both directions. *)
+  (let src = {|@action notify(team: String)
+
+schema Order:
+  - V: Int default 0
+
+predicate has_signal on { V: Int }:
+  V > 0 or V < -10
+
+rule fire on Order:
+  when:
+    has_signal
+  then:
+    notify("ops")
+
+test "only positive":
+  given Order:
+    V = 5
+  expect:
+    notify("ops")
+|} in
+   match parse src with
+   | Error ds -> Printf.printf "FAIL coverage: parse %s\n" (pp_diags ds); exit 1
+   | Ok p ->
+       (match IDSL.Typecheck.run p with
+        | Error ds ->
+            Printf.printf "FAIL coverage: tc %s\n" (pp_diags ds); exit 1
+        | Ok tp ->
+            let tbl = IDSL.Coverage.start () in
+            let _ = IDSL.Eval.run_all tp in
+            IDSL.Coverage.stop ();
+            let sum = IDSL.Coverage.summarise tbl in
+            (* `V > 0 or V < -10`: the OR site sees true (positive case);
+               never sees false (no test exercises both sides false).
+               So we expect exactly 1 site, partially covered. *)
+            if sum.total = 1 && sum.partial = 1 && sum.full = 0
+            then Printf.printf "ok   branch coverage detects partial sites\n"
+            else (Printf.printf "FAIL coverage: total=%d full=%d partial=%d\n"
+                    sum.total sum.full sum.partial; exit 1)));
+
+  (let src = {|@action notify(team: String)
+
+schema Order:
+  - Tier:  {Standard, Express} default Standard
+  - Value: Money default $100
+
+rule express on Order:
+  when:
+    Tier == Express
+  then:
+    notify("ops")
+
+rule big on Order:
+  when:
+    Value > $50
+  then:
+    notify("review")
+
+test "all defaults — Tier and Value fall back":
+  given Order:
+  expect:
+    not notify("ops")
+    notify("review")
+
+test "explicit value beats default":
+  given Order:
+    Tier = Express
+  expect:
+    notify("ops")
+    notify("review")
+|} in
+   match parse src with
+   | Error ds -> Printf.printf "FAIL defaults: parse %s\n" (pp_diags ds); exit 1
+   | Ok p ->
+       (match IDSL.Typecheck.run p with
+        | Error ds ->
+            Printf.printf "FAIL defaults: tc %s\n" (pp_diags ds); exit 1
+        | Ok tp ->
+            let results, _ = IDSL.Eval.run_all tp in
+            if List.for_all (fun r -> r.IDSL.Eval.passed) results
+            then Printf.printf "ok   default values fall back at runtime\n"
+            else (Printf.printf "FAIL defaults\n";
+                  List.iter (fun r ->
+                    if not r.IDSL.Eval.passed then
+                      List.iter (fun f -> Printf.printf "       %s\n" f) r.failures)
+                    results;
+                  exit 1)));
+
   (let src = {|@action notify(payload: String)
 
 schema Order:
@@ -485,7 +627,7 @@ test "regex doesn't match unrelated text":
   (let src = {|@action notify(team: String)
 
 schema Order:
-  - Cap: Money default $1
+  - Cap: Money                    # no default — actually missing-able
   - Required: Bool default true
 
 rule no_cap_when_required on Order:

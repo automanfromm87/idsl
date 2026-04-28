@@ -19,6 +19,8 @@ let usage () =
   prerr_endline "       idsl explain <file> --schema S --input obj.json [--json]";
   prerr_endline "       idsl whatif <file> --schema S --input obj.json --set F=V ...";
   prerr_endline "       idsl diff <file> --schema S --before a.json --after b.json";
+  prerr_endline "       idsl coverage <file>";
+  prerr_endline "       idsl info <file>";
   exit 2
 
 let die_with file diags =
@@ -208,6 +210,51 @@ let cmd_diff file rest =
   let schema_name, before_path, after_path = parse_diff_args rest in
   do_diff file schema_name (load_json before_path) (load_json after_path)
 
+(* Branch coverage: run every test with the eval-side `Coverage`
+   instrumentation enabled, then summarise which conditional sites
+   (`if`, `and`, `or`, `not`, `is missing`, `is present`) saw both
+   branches at least once. *)
+(* Print module identity / version / includes / decl counts.  This is
+   the minimal "package manifest" surface — enough for tooling to
+   identify a rule set without yet committing to a full registry. *)
+let cmd_info file =
+  let prog, tp = load file in
+  let meta key =
+    List.find_map (fun (m : IDSL.Ast.metadata) ->
+      if m.mkey = key then Some m.mvalue else None) tp.metas
+  in
+  let module_name = meta "module" in
+  let module_ver  = meta "module_version" in
+  let lang_ver    = meta "version" in
+  let includes = List.filter_map (function
+    | IDSL.Ast.TInclude i -> Some i.inc_path | _ -> None) prog in
+  Printf.printf "module:           %s\n"
+    (Option.value ~default:"(unnamed)" module_name);
+  Printf.printf "module_version:   %s\n"
+    (Option.value ~default:"(unset)" module_ver);
+  Printf.printf "language_version: %s\n"
+    (Option.value ~default:"(unset)" lang_ver);
+  if includes <> [] then begin
+    Printf.printf "includes:\n";
+    List.iter (fun p -> Printf.printf "  - %s\n" p) includes
+  end;
+  Printf.printf "schemas:    %d\n" (List.length tp.schemas);
+  Printf.printf "instances:  %d\n" (List.length tp.instances);
+  Printf.printf "predicates: %d\n" (List.length tp.predicates);
+  Printf.printf "rules:      %d\n" (List.length tp.rules);
+  Printf.printf "tests:      %d\n" (List.length tp.tests);
+  Printf.printf "actions:    %d\n" (List.length tp.actions)
+
+let cmd_coverage file =
+  let _, tp = load file in
+  let tbl = IDSL.Coverage.start () in
+  let _ = IDSL.Eval.run_all tp in
+  IDSL.Coverage.stop ();
+  let summary = IDSL.Coverage.summarise tbl in
+  print_string (IDSL.Coverage.report summary);
+  exit (if summary.IDSL.Coverage.uncovered = 0
+        && summary.IDSL.Coverage.partial = 0 then 0 else 1)
+
 let () =
   match Array.to_list Sys.argv with
   | _ :: "test"    :: file :: rest -> cmd_test  file rest
@@ -218,5 +265,7 @@ let () =
   | _ :: "explain" :: file :: rest -> cmd_explain file rest
   | _ :: "whatif"  :: file :: rest -> cmd_whatif  file rest
   | _ :: "diff"    :: file :: rest -> cmd_diff    file rest
+  | _ :: "coverage" :: file :: _   -> cmd_coverage file
+  | _ :: "info"     :: file :: _   -> cmd_info     file
   | _ :: file :: _                 -> cmd_dump file
   | _                              -> usage ()

@@ -488,12 +488,36 @@ let typecheck_schema schemas actions predicates instances domains sch =
            | Some te -> TFDerived (n, te)
            | None    -> TFRaw (n, TAny))) sch.sfields
   in
+  (* Capture each raw field's typed default so the runtime can fall
+     back when given/JSON-input data omits that field. *)
+  let env_for_defaults =
+    let base = make_env ~domains schemas (Hashtbl.create 0) instances in
+    { base with current_domain = sch.sdomain;
+                current_schema = Some (qualify sch.sdomain sch.sname);
+                fields = all_types }
+  in
+  let ts_defaults =
+    List.filter_map (fun (f : Ast.field) ->
+      match f with
+      | FRaw (pos, n, decl) ->
+          (match decl.fd_sample with
+           | None -> None
+           | Some e ->
+               let expected = List.assoc n raw_pairs in
+               (try Some (n, check env_for_defaults e expected)
+                with Type_error m ->
+                  push (mkdiag pos (Printf.sprintf
+                    "schema %s.%s default: %s" sch.sname n m));
+                  None))
+      | FDerived _ -> None) sch.sfields
+  in
   let tsch = {
     ts_name   = qualify sch.sdomain sch.sname;
     ts_bare   = sch.sname;
     ts_domain = sch.sdomain;
     ts_fields = tfields;
     ts_types  = all_types;
+    ts_defaults;
   } in
   (tsch, List.rev !errors)
 
@@ -711,6 +735,24 @@ let check_unique_enum_tags errors schema_pos tschemas =
    no longer accepted. *)
 let supported_versions = ["0.0.4"]
 
+let is_ident_shape s =
+  let n = String.length s in
+  n > 0 && (let c = s.[0] in
+            (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c = '_')
+  && (let ok = ref true in
+      String.iter (fun c ->
+        if not ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+                || (c >= '0' && c <= '9') || c = '_') then ok := false) s;
+      !ok)
+
+let is_semver_shape s =
+  let parts = String.split_on_char '.' s in
+  match parts with
+  | [a; b; c] ->
+      let is_num x = x <> "" && String.for_all (fun c -> c >= '0' && c <= '9') x in
+      is_num a && is_num b && is_num c
+  | _ -> false
+
 let check_metadata errors program =
   List.iter (function
     | Ast.TMeta { mkey = "version"; mvalue = v } ->
@@ -718,6 +760,14 @@ let check_metadata errors program =
           errors := mkdiag Lexing.dummy_pos (Printf.sprintf
             "@version(%S) not supported by this build (accept: %s)"
             v (String.concat ", " supported_versions)) :: !errors
+    | Ast.TMeta { mkey = "module"; mvalue = v } ->
+        if not (is_ident_shape v) then
+          errors := mkdiag Lexing.dummy_pos (Printf.sprintf
+            "@module(%S): expected an identifier-shaped name" v) :: !errors
+    | Ast.TMeta { mkey = "module_version"; mvalue = v } ->
+        if not (is_semver_shape v) then
+          errors := mkdiag Lexing.dummy_pos (Printf.sprintf
+            "@module_version(%S): expected semver X.Y.Z" v) :: !errors
     | _ -> ()) program
 
 (* Catch helper: convert Located (pos, m) and Type_error m at a known

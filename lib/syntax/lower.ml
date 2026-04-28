@@ -666,4 +666,30 @@ let lower_program (root : node) : Ast.program =
          | _ -> [])
     | GTok _ -> []
   in
-  List.concat_map (lower_one ~domain:None) root.nchildren
+  let tops = List.concat_map (lower_one ~domain:None) root.nchildren in
+  (* `@module("X")` makes every domainless top-level decl behave as
+     if it lived inside `domain X:`. This is what lets `include`d
+     files appear under their own namespace without forcing every
+     author to wrap their entire file in a `domain` block. *)
+  let module_name = List.find_map (function
+    | TMeta { mkey = "module"; mvalue = v } -> Some v
+    | _ -> None) tops in
+  match module_name with
+  | None      -> tops
+  | Some name ->
+      let lift = function
+        | TSchema    s when s.sdomain    = None ->
+            TSchema    { s with sdomain    = Some name }
+        | TRule      r when r.rdomain    = None ->
+            TRule      { r with rdomain    = Some name }
+        | TTest      t when t.tdomain    = None ->
+            TTest      { t with tdomain    = Some name }
+        | TInstance  i when i.idomain    = None ->
+            TInstance  { i with idomain    = Some name }
+        | TAction    a when a.asdomain   = None ->
+            TAction    { a with asdomain   = Some name }
+        | TPredicate p when p.pdomain    = None ->
+            TPredicate { p with pdomain    = Some name }
+        | other -> other
+      in
+      List.map lift tops
