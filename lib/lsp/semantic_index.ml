@@ -265,11 +265,8 @@ let collect_typed_refs idx (tp : tprogram) (canon : canon_tables) =
       add_ref idx (KAction name) ~length:(String.length name) cpos;
       List.iter (walk ~schema:sname) args
     in
-    List.iter (function
-      | TMust c | TMustNot c
-      | TTimes (c, _) | TAtLeast (c, _) | TAtMost (c, _) -> walk_call c
-      | TBefore (a, b) | TAfter (a, b) -> walk_call a; walk_call b)
-      t.tt_expect) tp.tests;
+    List.iter (fun ex ->
+      List.iter walk_call (texpectation_calls ex)) t.tt_expect) tp.tests;
   List.iter (fun (i : tinstance) ->
     List.iter (fun (_, te) -> walk ~schema:i.ti_schema te)
       i.ti_values) tp.instances;

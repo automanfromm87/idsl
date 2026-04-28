@@ -502,52 +502,34 @@ let lower_given_block (n : node) : given_block =
       mk ~sch ~sch_text:(tok_text sch) rest
   | _ -> err "given_block shape"
 
+(* Lower an NExpectation.  The grammar produces one of these positional
+   shapes after `significant`:
+
+     [not?; <expr>]                   — Must / MustNot
+     [<expr>; KW("times"|...); INT]   — count assertion
+     [<expr>; KW("before"|"after"); <expr>]  — ordering
+
+   We pattern-match directly instead of doing string-level keyword
+   probes; the grammar is the single source of truth. *)
 let lower_expectation (n : node) : expectation =
-  let kids = significant n.nchildren in
   let pos = fst n.nspan in
-  let is_kw kw = function GTok t -> t.kind = Cst.KW kw | _ -> false in
-  let starts_not = match kids with GTok t :: _ -> t.kind = Cst.KW "not" | _ -> false in
-  (* Strip a leading `not` so the rest can be analyzed uniformly. *)
-  let body = if starts_not then List.tl kids else kids in
-  let exprs = List.filter (function
-    | GNode e when e.nkind = NExpr || e.nkind = NAtom || e.nkind = NLiteral
-      -> true
-    | _ -> false) body in
-  let lower_exp = function GNode e -> lower_expr e | _ -> err "expectation expr" in
-  match starts_not, body with
-  | true, _ ->
-      (match exprs with
-       | [e] -> MustNot (pos, lower_exp e)
-       | _ -> err "`not` expectation must have one call")
-  | false, _ ->
-      (* Look for trailing modifier tokens. *)
-      let count_int () =
-        match List.rev kids with
-        | _nl :: GTok n :: _ when (match n.kind with Cst.Int _ -> true | _ -> false)
-          -> tok_int_payload n
-        | GTok n :: _ when (match n.kind with Cst.Int _ -> true | _ -> false)
-          -> tok_int_payload n
-        | _ -> err "count modifier requires an integer"
-      in
-      let has_kw kw = List.exists (is_kw kw) body in
-      if has_kw "times" then
-        Times (pos, lower_exp (List.hd exprs), count_int ())
-      else if has_kw "at_least" then
-        AtLeast (pos, lower_exp (List.hd exprs), count_int ())
-      else if has_kw "at_most" then
-        AtMost (pos, lower_exp (List.hd exprs), count_int ())
-      else if has_kw "before" then
-        (match exprs with
-         | [a; b] -> Before (pos, lower_exp a, lower_exp b)
-         | _ -> err "`before` needs two calls")
-      else if has_kw "after" then
-        (match exprs with
-         | [a; b] -> After (pos, lower_exp a, lower_exp b)
-         | _ -> err "`after` needs two calls")
-      else
-        (match exprs with
-         | [e] -> Must (pos, lower_exp e)
-         | _ -> err "expectation shape")
+  let int_of t = tok_int_payload t in
+  match significant n.nchildren with
+  | GTok { kind = Cst.KW "not"; _ } :: GNode e :: _ ->
+      MustNot (pos, lower_expr e)
+  | GNode a :: GTok { kind = Cst.KW "times"; _ } :: GTok n :: _ ->
+      Times (pos, lower_expr a, int_of n)
+  | GNode a :: GTok { kind = Cst.KW "at_least"; _ } :: GTok n :: _ ->
+      AtLeast (pos, lower_expr a, int_of n)
+  | GNode a :: GTok { kind = Cst.KW "at_most"; _ } :: GTok n :: _ ->
+      AtMost (pos, lower_expr a, int_of n)
+  | GNode a :: GTok { kind = Cst.KW "before"; _ } :: GNode b :: _ ->
+      Before (pos, lower_expr a, lower_expr b)
+  | GNode a :: GTok { kind = Cst.KW "after"; _ } :: GNode b :: _ ->
+      After (pos, lower_expr a, lower_expr b)
+  | GNode e :: _ ->
+      Must (pos, lower_expr e)
+  | _ -> err "expectation shape"
 
 let lower_expect_block (n : node) : expectation list =
   List.filter_map (function

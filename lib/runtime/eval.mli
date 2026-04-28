@@ -15,7 +15,7 @@ type value =
   | VList   of value list
   | VObject of (string * value) list
   | VTag    of string
-  | VRegex  of string
+  | VRegex  of string * Str.regexp
   | VMissing
   | VWildcard
 

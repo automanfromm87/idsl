@@ -303,9 +303,6 @@ domain b:
     - K2: {Active, Pending}
 |};
 
-  (* Object partial matching in expect: fields not listed are
-     ignored, so adding a payload field doesn't break existing
-     tests. *)
   (let src = {|@action notify(payload: String)
 
 schema Order:
@@ -343,7 +340,6 @@ rule emit_kvs on Order:
             then Printf.printf "ok   expect: object partial match (smoke)\n"
             else (Printf.printf "FAIL partial smoke\n"; exit 1)));
 
-  (* Count assertions: times / at_least / at_most. *)
   (let src = {|@action notify(team: String)
 
 schema Order:
@@ -401,7 +397,6 @@ test "at_most passes":
                       List.iter (fun f -> Printf.printf "       %s\n" f) r.failures) results;
                   exit 1)));
 
-  (* before / after ordering. *)
   (let src = {|@action flag(s: String)
 @action notify(t: String)
 
@@ -443,7 +438,6 @@ test "ordering":
                       List.iter (fun f -> Printf.printf "       %s\n" f) r.failures) results;
                   exit 1)));
 
-  (* Regex literal in expect: matches a string action arg by pattern. *)
   (let src = {|@action flag(reason: String)
 
 schema Order:

@@ -85,6 +85,11 @@ type texpectation =
   | TBefore   of tcall * tcall
   | TAfter    of tcall * tcall
 
+let texpectation_calls = function
+  | TMust c | TMustNot c
+  | TTimes (c, _) | TAtLeast (c, _) | TAtMost (c, _) -> [c]
+  | TBefore (a, b) | TAfter (a, b) -> [a; b]
+
 type ttest = {
   tt_name   : string;          (* canonical: "domain.<bare test name>" *)
   tt_bare   : string;          (* bare test-name string from source *)
