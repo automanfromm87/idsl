@@ -58,6 +58,18 @@ and lower_expr_general _nk kids : expr_node =
   match kids with
   (* MISSING / wildcard / ident leaf via NAtom *)
   | [GTok t] -> lower_atom_leaf t
+  (* domain.method(args) — qualified action / predicate call. Lowers
+     to ECall("domain.method", args); the typechecker then routes via
+     the actions / predicates table directly. *)
+  | GNode recv :: GTok dot :: GTok method_ :: GTok lp :: rest
+    when dot.kind = Cst.Punct "." && lp.kind = Cst.Punct "("
+      && is_ident_kind method_.kind
+      && (match significant recv.nchildren with
+          | [GTok t] -> is_ident_kind t.kind | _ -> false) ->
+      let dom = match significant recv.nchildren with
+        | [GTok t] -> tok_text t | _ -> err "qualified-call recv shape" in
+      let args = collect_call_args rest in
+      ECall (dom ^ "." ^ tok_text method_, args)
   (* IDENT . field — record the field token's pos for goto/refs/rename *)
   | [GNode recv; GTok dot; GTok field]
     when dot.kind = Cst.Punct "." ->
@@ -237,6 +249,10 @@ and lower_ty_annot (n : node) : ty_annot =
   match significant n.nchildren with
   | [GTok id] when is_ident_kind id.kind ->
       AnnScalar (tok_text id)
+  | [GTok dom; GTok dot; GTok id]
+    when is_ident_kind dom.kind && dot.kind = Cst.Punct "."
+      && is_ident_kind id.kind ->
+      AnnSchema (tok_text dom ^ "." ^ tok_text id)
   | GTok lb :: _ when lb.kind = Cst.Punct "{" ->
       let names = List.filter_map (function
         | GTok t when is_ident_kind t.kind -> Some (tok_text t)
@@ -256,18 +272,23 @@ and lower_sample_node (n : node) : Ast.expr =
         | [GTok t] -> lower_literal t
         | _ -> err "literal child" in
       Ast.mke pos endpos (ELit l)
+  | [GTok t] when is_ident_kind t.kind ->
+      Ast.mke pos endpos (EVar (tok_text t))
+  | [GTok dom; GTok dot; GTok id]
+    when is_ident_kind dom.kind && dot.kind = Cst.Punct "."
+      && is_ident_kind id.kind ->
+      let recv = Ast.mke dom.start dom.stop (EVar (tok_text dom)) in
+      Ast.mke pos endpos (EField (recv, id.start, tok_text id))
   | _ ->
-      let has_lbracket =
-        List.exists (function GTok t -> t.kind = Cst.Punct "[" | _ -> false) kids in
-      if has_lbracket then
+      let has c =
+        List.exists (function GTok t -> t.kind = Cst.Punct c | _ -> false) kids
+      in
+      if has "[" then
         Ast.mke pos endpos (EList (collect_list_elements kids))
+      else if has "{" then
+        Ast.mke pos endpos (EObject (collect_kvs kids))
       else
-        (* Bare ident sample, e.g. `e.g. NDA` — keep as an EVar; the
-           type-checker validates it against the declared type. *)
-        match kids with
-        | [GTok t] when is_ident_kind t.kind ->
-            Ast.mke pos endpos (EVar (tok_text t))
-        | _ -> err "sample shape unrecognised"
+        err "sample shape unrecognised"
 
 let lower_schema (n : node) : schema_def =
   let kids = significant n.nchildren in
@@ -352,18 +373,29 @@ let lower_given_assign (n : node) : field_assign =
   | _ -> err "given_assign shape"
 
 let lower_instance (n : node) : instance_def =
-  match significant n.nchildren with
-  | _inst :: GTok sch :: GTok name :: _c :: rest ->
-      let assigns = List.filter_map (function
-        | GNode a when a.nkind = NGivenAssign -> Some (lower_given_assign a)
-        | _ -> None) rest in
-      { iname        = tok_text name;
-        iname_pos    = name.start;
-        ischema      = tok_text sch;
-        ischema_pos  = sch.start;
-        ipos         = fst n.nspan;
-        ivalues      = assigns;
-        idomain      = None }
+  let kids = significant n.nchildren in
+  let mk_inst ~sch ~sch_text ~name rest =
+    let assigns = List.filter_map (function
+      | GNode a when a.nkind = NGivenAssign -> Some (lower_given_assign a)
+      | _ -> None) rest in
+    { iname        = tok_text name;
+      iname_pos    = name.start;
+      ischema      = sch_text;
+      ischema_pos  = sch.Cst.start;
+      ipos         = fst n.nspan;
+      ivalues      = assigns;
+      idomain      = None }
+  in
+  match kids with
+  (* `instance dom.Schema Name: ...` — try qualified first since the
+     unqualified pattern would also match the prefix. *)
+  | _inst :: GTok dom :: GTok dot :: GTok sch :: GTok name :: _c :: rest
+    when dot.kind = Cst.Punct "." && is_ident_kind dom.kind ->
+      mk_inst ~sch ~sch_text:(tok_text dom ^ "." ^ tok_text sch) ~name rest
+  (* `instance Schema Name: ...` *)
+  | _inst :: GTok sch :: GTok name :: _c :: rest
+    when is_ident_kind sch.kind && is_ident_kind name.kind ->
+      mk_inst ~sch ~sch_text:(tok_text sch) ~name rest
   | _ -> err "instance shape"
 
 (* ---------- rule / test ---------- *)
@@ -397,6 +429,10 @@ let lower_rule (n : node) : rule_def =
         (match significant m.nchildren with
          | [_; GTok name] ->
              rschema     := Some (tok_text name);
+             rschema_pos := Some name.start
+         | [_; GTok dom; GTok dot; GTok name]
+           when dot.kind = Cst.Punct "." ->
+             rschema     := Some (tok_text dom ^ "." ^ tok_text name);
              rschema_pos := Some name.start
          | _ -> ())
     | GNode m, `Pre when m.nkind = NRulePriority ->

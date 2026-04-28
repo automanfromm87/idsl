@@ -15,22 +15,27 @@ type env = {
   actions           : (ident, action_param_ty list) Hashtbl.t;
   predicates        : (ident, predicate_sig) Hashtbl.t;
   instances         : (ident, ident) Hashtbl.t;
+  domains           : (ident, unit) Hashtbl.t;
+                      (* set of declared domain names; lets the
+                         typechecker recognize `core.Money` etc. as a
+                         qualified ref rather than a field access *)
   fields            : (ident * ty) list;
   vars              : (ident * ty) list;
   strict_calls      : bool;
   current_domain    : ident option;
   current_schema    : ident option;
-  in_predicate_body : bool;        (* true while typechecking the body
-                                      of a predicate decl. Predicates
-                                      are pure-Bool: no actions, no
-                                      nested predicate calls. *)
+  in_predicate_body : bool;
 }
 
 let make_env ?(strict_calls = false) ?(predicates = Hashtbl.create 0)
+    ?(domains = Hashtbl.create 0)
     schemas actions instances =
-  { schemas; actions; predicates; instances; fields = []; vars = [];
+  { schemas; actions; predicates; instances; domains;
+    fields = []; vars = [];
     strict_calls; current_domain = None; current_schema = None;
     in_predicate_body = false }
+
+let is_domain env name = Hashtbl.mem env.domains name
 
 (* Domain-aware key derivation.  All decl tables (schemas / instances /
    actions) are keyed on the *qualified* name "domain.bare", with no
@@ -149,6 +154,20 @@ let rec infer env e : texpr =
            | None            -> TTag id
          in
          mk (TVar (VarTag id)) ty)
+  | EField ({ e_node = EVar dom_name; e_pos = dom_pos; _ }, _, f)
+    when is_domain env dom_name ->
+      (* `core.Money` etc. The first segment is a known domain; the
+         whole expression denotes a qualified schema / instance /
+         predicate / action — never a field access. *)
+      let qkey = dom_name ^ "." ^ f in
+      ignore dom_pos;
+      (match Hashtbl.find_opt env.instances qkey with
+       | Some sname -> mk (TVar (VarInstance qkey)) (TSchema sname)
+       | None ->
+           if Hashtbl.mem env.schemas qkey
+           then mk (TVar (VarTag qkey)) (TSchema qkey)
+           else err "%sunknown qualified reference `%s.%s`"
+                  (Printf.sprintf "%s: " (pp_pos e.e_pos)) dom_name f)
   | EField (obj, fpos, f) ->
       let to_ = infer env obj in
       let fty = field_type ~pos:e.e_pos env to_.ty f in
@@ -378,10 +397,14 @@ and check_object_fits env s kvs =
 
 (* Resolve a raw field's type from its declaration: explicit annotation
    wins; otherwise infer from the sample expression (which the parser
-   guarantees is present whenever no annotation was supplied). *)
-let infer_field_type ?domain schemas (decl : field_decl) : Types.ty =
+   guarantees is present whenever no annotation was supplied).  The
+   sample may reference cross-domain instances or schemas, so the env
+   it sees needs the workspace-wide domains / instances tables. *)
+let infer_field_type ?domain ?(instances = Hashtbl.create 0)
+    ?(domains = Hashtbl.create 0)
+    schemas (decl : field_decl) : Types.ty =
   let env =
-    let base = make_env schemas (Hashtbl.create 0) (Hashtbl.create 0) in
+    let base = make_env ~domains schemas (Hashtbl.create 0) instances in
     { base with current_domain = domain }
   in
   match decl.fd_ty, decl.fd_sample with
@@ -390,15 +413,17 @@ let infer_field_type ?domain schemas (decl : field_decl) : Types.ty =
   | Some ty, None     -> resolve_ty_annot ?domain schemas ty
   | Some ty, Some e   ->
       let resolved = resolve_ty_annot ?domain schemas ty in
-      let _ = check env e resolved in   (* raises Type_error on mismatch *)
+      let _ = check env e resolved in
       resolved
 
-let typecheck_schema schemas actions predicates sch =
+let typecheck_schema schemas actions predicates instances domains sch =
   let errors = ref [] in
   let push d = errors := d :: !errors in
   let raw_pairs = List.filter_map (function
     | FRaw (pos, n, decl) ->
-        (try Some (n, infer_field_type ?domain:sch.sdomain schemas decl)
+        (try Some (n,
+          infer_field_type ?domain:sch.sdomain
+            ~instances ~domains schemas decl)
          with Type_error m ->
            push (mkdiag pos
              (Printf.sprintf "schema %s.%s: %s" sch.sname n m));
@@ -415,8 +440,7 @@ let typecheck_schema schemas actions predicates sch =
   let derived_typed_acc, all_types =
     List.fold_left (fun (dacc, tyacc) (n, e) ->
       let env =
-        { schemas; actions; predicates;
-          instances = Hashtbl.create 0;
+        { schemas; actions; predicates; instances; domains;
           fields = tyacc; vars = []; strict_calls = false;
           current_domain = sch.sdomain;
           current_schema = Some (qualify sch.sdomain sch.sname);
@@ -619,25 +643,33 @@ let typecheck_action schemas a =
 
 (* ---------- driver ---------- *)
 
-(* Walk all schema field types, collect every enum tag, error if any tag
-   appears in more than one enum field. Forces unambiguous tag → enum
-   resolution at compare-time. *)
+(* Enum tags must be unique *within the schema's domain* — same tag
+   name in two different domains is fine.  Bare tag references are
+   resolved through the enum's TEnum set at the comparison site, which
+   is already domain-local; this check is a clarity guard against
+   confusing duplicates inside one domain. *)
 let check_unique_enum_tags errors schema_pos tschemas =
-  let seen : (string, string) Hashtbl.t = Hashtbl.create 32 in
+  let seen : (string * string, string) Hashtbl.t = Hashtbl.create 32 in
+  let domain_of canon =
+    match String.index_opt canon '.' with
+    | Some i -> String.sub canon 0 i
+    | None   -> ""
+  in
   List.iter (fun s ->
     let pos = try Hashtbl.find schema_pos s.ts_name
               with Not_found -> Lexing.dummy_pos in
+    let dom = domain_of s.ts_name in
     List.iter (fun (fname, ty) ->
       match ty with
       | TEnum tags ->
           let where = Printf.sprintf "%s.%s" s.ts_name fname in
           List.iter (fun t ->
-            match Hashtbl.find_opt seen t with
+            match Hashtbl.find_opt seen (dom, t) with
             | Some other when other <> where ->
                 errors := mkdiag pos (Printf.sprintf
-                  "enum tag `%s` declared in both %s and %s — tags must be unique across all enum fields"
+                  "enum tag `%s` declared in both %s and %s — tags must be unique within a domain"
                   t other where) :: !errors
-            | _ -> Hashtbl.replace seen t where) tags
+            | _ -> Hashtbl.replace seen (dom, t) where) tags
       | _ -> ()) s.ts_types) tschemas
 
 (* Versions of the DSL surface this build accepts.
@@ -667,6 +699,18 @@ let run program =
   let actions   = Hashtbl.create 8 in
   let action_decls = ref [] in
   let instances = Hashtbl.create 8 in
+  let domains   = Hashtbl.create 4 in
+  (* Collect every declared domain name so the typechecker can spot
+     `core.Money` as a qualified ref instead of a field access. *)
+  List.iter (function
+    | Ast.TSchema { sdomain = Some d; _ }
+    | Ast.TRule   { rdomain = Some d; _ }
+    | Ast.TTest   { tdomain = Some d; _ }
+    | Ast.TInstance { idomain = Some d; _ }
+    | Ast.TAction { asdomain = Some d; _ }
+    | Ast.TPredicate { pdomain = Some d; _ } ->
+        Hashtbl.replace domains d ()
+    | _ -> ()) program;
   let errors : Diagnostic.t list ref = ref [] in
   let push d = errors := d :: !errors in
   check_metadata errors program;
@@ -709,29 +753,38 @@ let run program =
         { ps_params = List.map (fun (n, t, _) -> (n, t)) resolved };
       Hashtbl.add predicate_param_meta key (resolved, p)
     ) (Ast.predicates program);
-  let schema_pos : (ident, Lexing.position) Hashtbl.t = Hashtbl.create 16 in
-  let tschemas =
-    List.filter_map (fun s ->
-      let key = qualify s.sdomain s.sname in
-      Hashtbl.replace schema_pos key s.spos;
-      let tsch, errs = typecheck_schema schemas actions predicates s in
-      Hashtbl.replace schemas key tsch;
-      List.iter push errs;
-      Some tsch) (Ast.schemas program) in
-  check_unique_enum_tags errors schema_pos tschemas;
+  (* Pre-register instance (key → schema_key) mappings before schema
+     bodies typecheck, so a derived field can resolve a sample like
+     `core.Alpha` to its TSchema type. The instance's *value* is type-
+     checked later, when the env is fully populated. *)
+  let inst_schema_key idomain ischema =
+    if String.contains ischema '.' then ischema
+    else qualify idomain ischema
+  in
   List.iter (fun i ->
     let key = qualify i.idomain i.iname in
     if Hashtbl.mem instances key then
       push (mkdiag i.ipos (Printf.sprintf "duplicate instance %s" key))
     else
-      let schema_key = resolve_key schemas ~domain:i.idomain i.ischema in
-      Hashtbl.add instances key schema_key)
+      Hashtbl.add instances key (inst_schema_key i.idomain i.ischema))
     (Ast.instances program);
+  let schema_pos : (ident, Lexing.position) Hashtbl.t = Hashtbl.create 16 in
+  let tschemas =
+    List.filter_map (fun s ->
+      let key = qualify s.sdomain s.sname in
+      Hashtbl.replace schema_pos key s.spos;
+      let tsch, errs =
+        typecheck_schema schemas actions predicates instances domains s in
+      Hashtbl.replace schemas key tsch;
+      List.iter push errs;
+      Some tsch) (Ast.schemas program) in
+  check_unique_enum_tags errors schema_pos tschemas;
   let strict_calls =
     List.exists (function
       | Ast.TMeta { mkey = "strict_actions"; _ } -> true
       | _ -> false) program in
-  let env = make_env ~strict_calls ~predicates schemas actions instances in
+  let env = make_env ~strict_calls ~predicates ~domains
+                     schemas actions instances in
   let tinstances =
     List.filter_map (fun i ->
       match with_diag i.ipos (fun () -> typecheck_instance env i) with

@@ -124,6 +124,10 @@ instance_def:
   | inst=INSTANCE sch=IDENT name=IDENT c=COLON n0=nls assigns=list(given_assign)
     { mk Cst.NInstance $startpos $endpos
         ([g inst; g sch; g name; g c] @ gs n0 @ assigns) }
+  | inst=INSTANCE dom=IDENT dot=DOT sch=IDENT name=IDENT c=COLON n0=nls
+    assigns=list(given_assign)
+    { mk Cst.NInstance $startpos $endpos
+        ([g inst; g dom; g dot; g sch; g name; g c] @ gs n0 @ assigns) }
 
 metadata:
   | at=AT k=IDENT lp=LPAREN v=STRING rp=RPAREN
@@ -162,6 +166,8 @@ comma_seq_record:
 ty_annot:
   | id=IDENT
     { mk Cst.NTyAnnot $startpos $endpos [g id] }
+  | dom=IDENT dot=DOT id=IDENT
+    { mk Cst.NTyAnnot $startpos $endpos [g dom; g dot; g id] }
   | lb=LBRACE xs=comma_seq_ident rb=RBRACE
     { mk Cst.NTyAnnot $startpos $endpos ([g lb] @ xs @ [g rb]) }
   | lbk=LBRACKET t=ty_annot rbk=RBRACKET
@@ -194,8 +200,12 @@ example:
     { mk Cst.NExample $startpos $endpos [l] }
   | id=IDENT
     { mk Cst.NExample $startpos $endpos [g id] }
+  | dom=IDENT dot=DOT id=IDENT
+    { mk Cst.NExample $startpos $endpos [g dom; g dot; g id] }
   | lb=LBRACKET es=comma_seq_green rb=RBRACKET
     { mk Cst.NExample $startpos $endpos ([g lb] @ es @ [g rb]) }
+  | lb=LBRACE kvs=comma_seq_kv rb=RBRACE
+    { mk Cst.NExample $startpos $endpos ([g lb] @ kvs @ [g rb]) }
 
 literal:
   | i=INT    { mk Cst.NLiteral $startpos $endpos [g i] }
@@ -222,6 +232,8 @@ rule_def:
 rule_on:
   | on=ON s=IDENT
     { mk Cst.NRuleOn $startpos $endpos [g on; g s] }
+  | on=ON dom=IDENT dot=DOT s=IDENT
+    { mk Cst.NRuleOn $startpos $endpos [g on; g dom; g dot; g s] }
 
 rule_priority:
   | pri=PRIORITY n=INT
@@ -341,6 +353,9 @@ expr:
 
 atom:
   | l=literal { l }
+  | a=atom dot=DOT f=IDENT lp=LPAREN args=comma_seq_green rp=RPAREN
+    { mk Cst.NAtom $startpos $endpos
+        ([a; g dot; g f; g lp] @ args @ [g rp]) }
   | a=atom dot=DOT f=IDENT
     { mk Cst.NAtom $startpos $endpos [a; g dot; g f] }
   | id=IDENT lp=LPAREN args=comma_seq_green rp=RPAREN

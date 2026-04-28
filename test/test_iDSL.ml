@@ -165,6 +165,126 @@ test "thresholds" on Order:
               Printf.printf "\n"; exit 1
             end));
 
+  (* Cross-domain qualified refs.  A `core` domain defines a shared
+     `Money` schema; `shipping` consumes it via `core.Money` in
+     type-annotation position. *)
+  (let src = {|domain core:
+  schema Money:
+    - Amount: Int e.g. 0
+    - Currency: {USD, EUR} e.g. USD
+
+domain shipping:
+  schema Order:
+    - Total: core.Money e.g. {Amount: 50, Currency: USD}
+|} in
+   match parse src with
+   | Error ds ->
+       Printf.printf "FAIL cross-domain ty: parse %s\n" (pp_diags ds); exit 1
+   | Ok p ->
+       (match IDSL.Typecheck.run p with
+        | Error ds ->
+            Printf.printf "FAIL cross-domain ty: %s\n" (pp_diags ds); exit 1
+        | Ok _ ->
+            Printf.printf "ok   cross-domain type annotation\n"));
+
+  (* Cross-domain action call: `core.notify(...)` from inside another
+     domain resolves to the action declared in `core`. *)
+  (let src = {|domain core:
+  @action notify(team: String)
+
+domain shipping:
+  schema Order:
+    - V: Int e.g. 1
+
+  rule big on Order:
+    when:
+      V > 0
+    then:
+      core.notify("ops")
+
+  test "qualified action call":
+    given Order:
+      V = 5
+    expect:
+      core.notify("ops")
+|} in
+   match parse src with
+   | Error ds ->
+       Printf.printf "FAIL cross-domain call: parse %s\n" (pp_diags ds); exit 1
+   | Ok p ->
+       (match IDSL.Typecheck.run p with
+        | Error ds ->
+            Printf.printf "FAIL cross-domain call: %s\n" (pp_diags ds); exit 1
+        | Ok tp ->
+            let results, _ = IDSL.Eval.run_all tp in
+            if List.for_all (fun r -> r.IDSL.Eval.passed) results
+            then Printf.printf "ok   cross-domain action call\n"
+            else (Printf.printf "FAIL cross-domain call (runtime)\n"; exit 1)));
+
+  (* Cross-domain instance reference: `core.Alpha` resolves to an
+     instance declared in `core`, used inside a `shipping` schema. *)
+  (let src = {|domain core:
+  schema Party:
+    - Name: e.g. "x"
+  instance Party Alpha:
+    Name = "Alpha"
+
+domain shipping:
+  schema Order:
+    - P: core.Party e.g. core.Alpha
+|} in
+   match parse src with
+   | Error ds ->
+       Printf.printf "FAIL cross-domain instance: parse %s\n" (pp_diags ds);
+       exit 1
+   | Ok p ->
+       (match IDSL.Typecheck.run p with
+        | Error ds ->
+            Printf.printf "FAIL cross-domain instance: %s\n" (pp_diags ds);
+            exit 1
+        | Ok _ -> Printf.printf "ok   cross-domain instance reference\n"));
+
+  (* Cross-domain predicate call. *)
+  (let src = {|domain core:
+  predicate is_high on { V: Int }: V > 100
+
+domain shipping:
+  schema Order:
+    - V: Int e.g. 1
+    - Risk: i.e. core.is_high(self)
+|} in
+   match parse src with
+   | Error ds ->
+       Printf.printf "FAIL cross-domain pred: parse %s\n" (pp_diags ds);
+       exit 1
+   | Ok p ->
+       (match IDSL.Typecheck.run p with
+        | Error ds ->
+            Printf.printf "FAIL cross-domain pred: %s\n" (pp_diags ds);
+            exit 1
+        | Ok _ -> Printf.printf "ok   cross-domain predicate call\n"));
+
+  (* Enum tags are domain-local: same tag name can appear in two
+     domains without colliding.  Inside a single domain, dup tags
+     across schemas are still rejected. *)
+  assert_tc_ok "enum tag domain-local: same name in two domains"
+    {|domain a:
+  schema S:
+    - K: {Active, Closed}
+domain b:
+  schema T:
+    - K: {Active, Closed}
+|};
+
+  assert_tc_err "enum tag clash inside one domain"
+    "tags must be unique within a domain"
+    {|domain a:
+  schema S:
+    - K: {Active, Closed}
+  schema T:
+    - K2: {Active, Pending}
+|};
+
   (* Three-valued logic: a comparison whose operand is `missing`
      yields `missing`, which propagates through `not` / `and` / `or`
      / `if` / `==`. Rule when-blocks treat missing as false (rule

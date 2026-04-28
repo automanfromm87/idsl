@@ -37,13 +37,17 @@ let collect_schemas env program =
       Hashtbl.add env.schema_names k (field_names s.sfields))
     (schemas program)
 
-(* Bare reference `X` inside domain D: try (Some D, X) first, then
-   global (None, X).  Cross-domain references aren't supported yet
-   (Phase 1 limitation). *)
+(* Resolve a schema reference. Qualified names (`other.X`) bypass the
+   domain-scoped lookup and target an explicit (Some other, X) pair. *)
 let resolve_schema env ~domain name =
-  if Hashtbl.mem env.schema_names (domain, name) then true
-  else if Hashtbl.mem env.schema_names (None, name) then true
-  else false
+  match String.index_opt name '.' with
+  | Some i ->
+      let dom = String.sub name 0 i in
+      let bare = String.sub name (i + 1) (String.length name - i - 1) in
+      Hashtbl.mem env.schema_names (Some dom, bare)
+  | None ->
+      Hashtbl.mem env.schema_names (domain, name)
+      || Hashtbl.mem env.schema_names (None, name)
 
 let check_list_element env ~domain where e =
   match e.e_node with
