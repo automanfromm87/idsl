@@ -442,10 +442,35 @@ let run_all ?(filter = fun _ -> true) (tp : tprogram) =
   let results = List.map (run_test ctx) tests in
   results, ctx.rules
 
+(* Strip the trailing " #N" a table-driven test inserts, returning the
+   parent name. Not a table case → returns the original name. *)
+let case_parent name =
+  match String.rindex_opt name '#' with
+  | Some i when i > 0 && name.[i - 1] = ' ' ->
+      let stem = String.sub name 0 (i - 1) in
+      let suffix = String.sub name (i + 1) (String.length name - i - 1) in
+      (try ignore (int_of_string suffix); Some stem
+       with _ -> None)
+  | _ -> None
+
 let report ?(explain_failures = true) (results, all_rules) =
   let passed = List.length (List.filter (fun r -> r.passed) results) in
   let total = List.length results in
-  List.iter (fun r ->
+  (* Group consecutive passing table cases under their parent name. *)
+  let rec emit_group = function
+    | [] -> ()
+    | r :: rest when not r.passed -> emit_one r; emit_group rest
+    | r :: _ as all ->
+        match case_parent r.rname with
+        | None -> emit_one r; emit_group (List.tl all)
+        | Some parent ->
+            let same, others = List.partition (fun r' ->
+              r'.passed && case_parent r'.rname = Some parent) all in
+            (match List.length same with
+             | 1 -> emit_one r
+             | n -> Printf.printf "PASS  %s  (%d cases)\n" parent n);
+            emit_group others
+  and emit_one r =
     if r.passed then Printf.printf "PASS  %s\n" r.rname
     else begin
       Printf.printf "FAIL  %s\n" r.rname;
@@ -479,7 +504,9 @@ let report ?(explain_failures = true) (results, all_rules) =
                 Printf.printf "        [✗ skip ] %s — %s false\n"
                   (String.concat "." rule.tr_path) reason
               end) all_rules
-    end) results;
+    end
+  in
+  emit_group results;
   Printf.printf "\n%d/%d test(s) passed\n" passed total;
   (* coverage: which rules fired in at least one test *)
   let fire_count = Hashtbl.create 16 in

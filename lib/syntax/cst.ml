@@ -140,6 +140,8 @@ type node_kind =
   | NGivenAssign
   | NExpectBlock
   | NExpectation
+  | NCasesBlock
+  | NCase
   | NExpr
   | NAtom
   | NKv
@@ -173,6 +175,8 @@ let pp_node_kind = function
   | NGivenAssign  -> "GivenAssign"
   | NExpectBlock  -> "ExpectBlock"
   | NExpectation  -> "Expectation"
+  | NCasesBlock   -> "CasesBlock"
+  | NCase         -> "Case"
   | NExpr         -> "Expr"
   | NAtom         -> "Atom"
   | NKv           -> "Kv"

@@ -111,6 +111,60 @@ schema Amendment:
   self == self
 |};
 
+  assert_tc_err "predicate body cannot call another predicate"
+    "cannot call other predicates"
+    {|predicate inner on { Y: Int }: Y > 0
+predicate outer on { Y: Int }: inner(self)
+|};
+
+  assert_tc_err "predicate body cannot call an action"
+    "cannot call actions"
+    {|@action notify(team: String)
+predicate p on { X: Int }: notify("ops")
+|};
+
+  (* Table-driven test: each `case -> action(...)` line lowers to a
+     standalone test_def at runtime; all of them run + report. *)
+  (let src = {|@action flag(severity: {info, warn, alert}, reason: String)
+
+schema Order:
+  - Total: Money e.g. $1
+
+rule big_order on Order:
+  when:
+    Total > $1,000
+  then:
+    flag(alert, "big")
+
+test "thresholds" on Order:
+  cases:
+    Total = $999    -> not flag(_, _)
+    Total = $1,000  -> not flag(_, _)
+    Total = $1,001  -> flag(alert, "big")
+|} in
+   match parse src with
+   | Error ds ->
+       Printf.printf "FAIL table tests: parse %s\n" (pp_diags ds); exit 1
+   | Ok p ->
+       (match IDSL.Typecheck.run p with
+        | Error ds ->
+            Printf.printf "FAIL table tests: tc %s\n" (pp_diags ds); exit 1
+        | Ok tp ->
+            let n = List.length tp.IDSL.Typed.tests in
+            if n <> 3 then
+              (Printf.printf "FAIL table tests: expected 3 cases, got %d\n" n;
+               exit 1);
+            let results, _ = IDSL.Eval.run_all tp in
+            if List.for_all (fun r -> r.IDSL.Eval.passed) results
+            then Printf.printf "ok   table-driven test (3 cases)\n"
+            else begin
+              Printf.printf "FAIL table tests: ";
+              List.iter (fun r ->
+                if not r.IDSL.Eval.passed then
+                  Printf.printf "%s " r.IDSL.Eval.rname) results;
+              Printf.printf "\n"; exit 1
+            end));
+
   (* End-to-end: predicate is callable from a derived field, runtime
      evaluates it against the schema's row, and the rule fires
      accordingly. *)

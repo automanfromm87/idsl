@@ -24,7 +24,7 @@ let opt = function Some x -> [x] | None -> []
 %token <Cst.tok> EG IE
 %token <Cst.tok> TEST GIVEN EXPECT
 %token <Cst.tok> ACTION INSTANCE ON PRIORITY INCLUDE DOMAIN
-%token <Cst.tok> PREDICATE SELF
+%token <Cst.tok> PREDICATE SELF CASES ARROW
 %token <Cst.tok> COLON COMMA LPAREN RPAREN LBRACKET RBRACKET LBRACE RBRACE
 %token <Cst.tok> DOT AT PIPE
 %token <Cst.tok> EQEQ NEQ LEQ GEQ LT GT EQ UNDERSCORE
@@ -248,6 +248,37 @@ test_def:
     e0=expect_block
     { mk Cst.NTest $startpos $endpos
         ([g tk; g name; g c] @ gs n0 @ [g0; e0]) }
+  | tk=TEST name=STRING on=ON sch=IDENT c=COLON n0=nls
+    cb=cases_block
+    { mk Cst.NTest $startpos $endpos
+        ([g tk; g name; g on; g sch; g c] @ gs n0 @ [cb]) }
+
+cases_block:
+  | ck=CASES c=COLON n0=nls cs=list(test_case)
+    { mk Cst.NCasesBlock $startpos $endpos
+        ([g ck; g c] @ gs n0 @ cs) }
+
+test_case:
+  | assigns=comma_seq_assign arrow=ARROW expect=case_expectation
+    nl=NEWLINE n0=nls
+    { mk Cst.NCase $startpos $endpos
+        (assigns @ [g arrow; expect; g nl] @ gs n0) }
+
+(* Each case starts with at least one `field = value` and may chain
+   more with commas. *)
+comma_seq_assign:
+  | a=case_assign { [a] }
+  | a=case_assign c=COMMA rest=comma_seq_assign { a :: g c :: rest }
+
+case_assign:
+  | name=IDENT eq=EQ value=expr
+    { mk Cst.NGivenAssign $startpos $endpos [g name; g eq; value] }
+
+case_expectation:
+  | nk=NOT e=expr
+    { mk Cst.NExpectation $startpos $endpos [g nk; e] }
+  | e=expr
+    { mk Cst.NExpectation $startpos $endpos [e] }
 
 given_block:
   | gk=GIVEN sch=IDENT c=COLON n0=nls assigns=list(given_assign)

@@ -31,7 +31,7 @@ let is_keyword = function
   | "true" | "false" | "min" | "max" | "for"
   | "test" | "given" | "expect" | "action" | "instance"
   | "on" | "priority" | "include" | "domain"
-  | "predicate" | "self" -> true
+  | "predicate" | "self" | "cases" -> true
   | _ -> false
 
 (* tokens after which a newline is treated as continuation *)
@@ -43,7 +43,7 @@ let is_continuation = function
   | EG _ | IE _ | LBRACKET _ | COLON _ | LBRACE _ | EQ _
   | TEST _ | GIVEN _ | EXPECT _
   | ACTION _ | PIPE _ | INSTANCE _ | ON _ | PRIORITY _ | INCLUDE _
-  | DOMAIN _
+  | DOMAIN _ | PREDICATE _ | CASES _ | ARROW _
     -> true
   | _ -> false
 
@@ -138,6 +138,7 @@ rule token = parse
           | "domain"   -> (fun ct -> DOMAIN ct)
           | "predicate" -> (fun ct -> PREDICATE ct)
           | "self"     -> (fun ct -> SELF ct)
+          | "cases"    -> (fun ct -> CASES ct)
           | _ -> assert false
         in
         emit_log lexbuf (KW id) parser_tok_ctor
@@ -150,6 +151,7 @@ rule token = parse
   | '<'                         { emit_log lexbuf (Op "<") (fun ct -> LT ct) }
   | '>'                         { emit_log lexbuf (Op ">") (fun ct -> GT ct) }
   | '+'                         { emit_log lexbuf (Op "+") (fun ct -> PLUS ct) }
+  | "->"                        { emit_log lexbuf (Punct "->") (fun ct -> ARROW ct) }
   | '-'                         { emit_log lexbuf (Op "-") (fun ct -> MINUS ct) }
   | '*'                         { emit_log lexbuf (Op "*") (fun ct -> STAR ct) }
   | '/'                         { emit_log lexbuf (Op "/") (fun ct -> SLASH ct) }

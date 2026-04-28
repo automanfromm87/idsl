@@ -461,10 +461,38 @@ let lower_expect_block (n : node) : expectation list =
     | GNode e when e.nkind = NExpectation -> Some (lower_expectation e)
     | _ -> None) (significant n.nchildren)
 
-let lower_test (n : node) : test_def =
+(* Lower a single case (`F = v, F = v -> [not] expr`) into a 1-line
+   given block + 1-element expect list. *)
+let lower_case (n : node) ~gschema ~gschema_pos
+    : (Ast.field_assign list * expectation) =
+  let kids = significant n.nchildren in
+  let assigns = List.filter_map (function
+    | GNode g when g.nkind = NGivenAssign ->
+        let kk = significant g.nchildren in
+        (match kk with
+         | [GTok name; GTok _eq; v] ->
+             Some { aname = tok_text name;
+                    aname_pos = name.start;
+                    avalue = lower_expr_g v;
+                    apos = name.start }
+         | _ -> err "case assign shape")
+    | _ -> None) kids in
+  let exp_node = List.find_map (function
+    | GNode e when e.nkind = NExpectation -> Some e
+    | _ -> None) kids in
+  match exp_node with
+  | None -> err "case missing expect expression"
+  | Some en ->
+      ignore gschema; ignore gschema_pos;
+      (assigns, lower_expectation en)
+
+let lower_test_one (n : node) : test_def list =
   let kids = significant n.nchildren in
   let tname_tok = List.find_map (function
     | GTok t when (match t.kind with Cst.Str _ -> true | _ -> false) -> Some t
+    | _ -> None) kids in
+  let cases_block = List.find_map (function
+    | GNode m when m.nkind = NCasesBlock -> Some m
     | _ -> None) kids in
   let g_block = List.find_map (function
     | GNode m when m.nkind = NGivenBlock -> Some (lower_given_block m)
@@ -472,14 +500,49 @@ let lower_test (n : node) : test_def =
   let e_block = List.find_map (function
     | GNode m when m.nkind = NExpectBlock -> Some (lower_expect_block m)
     | _ -> None) kids in
-  match tname_tok, g_block, e_block with
-  | Some t, Some g, Some e ->
-      { tname    = tok_string_payload t;
-        tpos     = t.start;          (* anchor at the test's name string *)
-        tgiven   = g;
-        texpect  = e;
-        tdomain  = None }
+  match tname_tok, cases_block, g_block, e_block with
+  | Some t, Some cb, _, _ ->
+      (* Table-driven form: `test "name" on Schema: cases: ...`.
+         The schema sits on the test header, just before the colon. *)
+      let on_sch = List.find_map (function
+        | GTok tk when is_ident_kind tk.kind -> Some tk
+        | _ -> None) (List.filter (function
+            | GTok tk -> (match tk.kind with
+                | Cst.Ident _ -> true | _ -> false)
+            | _ -> false) kids) in
+      let sch_tok = match on_sch with
+        | Some s -> s
+        | None -> err "table-driven test missing `on Schema:`" in
+      let cases_kids = significant cb.nchildren in
+      let cases = List.filter_map (function
+        | GNode c when c.nkind = NCase -> Some c
+        | _ -> None) cases_kids in
+      let base = tok_string_payload t in
+      List.mapi (fun i case_node ->
+        let assigns, expectation = lower_case case_node
+          ~gschema:(tok_text sch_tok)
+          ~gschema_pos:sch_tok.start in
+        { tname   = Printf.sprintf "%s #%d" base (i + 1);
+          tpos    = t.start;
+          tgiven  = { gschema     = tok_text sch_tok;
+                      gschema_pos = sch_tok.start;
+                      gvalues     = assigns };
+          texpect = [expectation];
+          tdomain = None }) cases
+  | Some t, None, Some g, Some e ->
+      [{ tname   = tok_string_payload t;
+         tpos    = t.start;
+         tgiven  = g;
+         texpect = e;
+         tdomain = None }]
   | _ -> err "test shape"
+
+(* Backwards-compat single-result wrapper for the few internal callers
+   that still want one (currently none). *)
+let lower_test (n : node) : test_def =
+  match lower_test_one n with
+  | [t] -> t
+  | _ -> err "use lower_test_one for table-driven tests"
 
 (* ---------- top-level ---------- *)
 
@@ -512,7 +575,9 @@ let lower_program (root : node) : Ast.program =
          | NAction    -> [attach_domain ~domain (TAction    (lower_action_sig n))]
          | NSchema    -> [attach_domain ~domain (TSchema    (lower_schema     n))]
          | NRule      -> [attach_domain ~domain (TRule      (lower_rule       n))]
-         | NTest      -> [attach_domain ~domain (TTest      (lower_test       n))]
+         | NTest      ->
+             List.map (fun td ->
+               attach_domain ~domain (TTest td)) (lower_test_one n)
          | NInstance  -> [attach_domain ~domain (TInstance  (lower_instance   n))]
          | NPredicate -> [attach_domain ~domain (TPredicate (lower_predicate  n))]
          | NInclude   -> [TInclude   (lower_include    n)]

@@ -11,22 +11,26 @@ type action_param_ty = { pty_name : ident; pty : ty }
 type predicate_sig = { ps_params : (ident * ty) list }
 
 type env = {
-  schemas        : (ident, tschema) Hashtbl.t;
-  actions        : (ident, action_param_ty list) Hashtbl.t;
-  predicates     : (ident, predicate_sig) Hashtbl.t;
-  instances      : (ident, ident) Hashtbl.t;
-  fields         : (ident * ty) list;
-  vars           : (ident * ty) list;
-  strict_calls   : bool;
-  current_domain : ident option;
-  current_schema : ident option;   (* canonical schema key of the
-                                      enclosing context, if any *)
+  schemas           : (ident, tschema) Hashtbl.t;
+  actions           : (ident, action_param_ty list) Hashtbl.t;
+  predicates        : (ident, predicate_sig) Hashtbl.t;
+  instances         : (ident, ident) Hashtbl.t;
+  fields            : (ident * ty) list;
+  vars              : (ident * ty) list;
+  strict_calls      : bool;
+  current_domain    : ident option;
+  current_schema    : ident option;
+  in_predicate_body : bool;        (* true while typechecking the body
+                                      of a predicate decl. Predicates
+                                      are pure-Bool: no actions, no
+                                      nested predicate calls. *)
 }
 
 let make_env ?(strict_calls = false) ?(predicates = Hashtbl.create 0)
     schemas actions instances =
   { schemas; actions; predicates; instances; fields = []; vars = [];
-    strict_calls; current_domain = None; current_schema = None }
+    strict_calls; current_domain = None; current_schema = None;
+    in_predicate_body = false }
 
 (* Domain-aware key derivation.  All decl tables (schemas / instances /
    actions) are keyed on the *qualified* name "domain.bare", with no
@@ -205,7 +209,24 @@ let rec infer env e : texpr =
   | ECall (name, args) ->
       (* Predicate call: `is_high_risk(self)`. The signature is a
          structural record type; the single argument must expose every
-         declared (field, type) pair of the predicate's signature. *)
+         declared (field, type) pair of the predicate's signature.
+
+         Predicate bodies themselves are restricted: no nested
+         predicate calls, no action calls. Both rules are enforced
+         here — predicates dispatch via this branch, and actions land
+         in `function not allowed in expression context` below. *)
+      if env.in_predicate_body
+         && (Hashtbl.mem env.predicates name
+             || (match env.current_domain with
+                 | Some d -> Hashtbl.mem env.predicates (d ^ "." ^ name)
+                 | None   -> false))
+      then err "predicate body cannot call other predicates";
+      if env.in_predicate_body
+         && (Hashtbl.mem env.actions name
+             || (match env.current_domain with
+                 | Some d -> Hashtbl.mem env.actions (d ^ "." ^ name)
+                 | None   -> false))
+      then err "predicate body cannot call actions (predicates are pure)";
       (match scoped_find_canon env.predicates env name with
        | None ->
            err "function `%s` not allowed in expression context" name
@@ -398,7 +419,8 @@ let typecheck_schema schemas actions predicates sch =
           instances = Hashtbl.create 0;
           fields = tyacc; vars = []; strict_calls = false;
           current_domain = sch.sdomain;
-          current_schema = Some (qualify sch.sdomain sch.sname) } in
+          current_schema = Some (qualify sch.sdomain sch.sname);
+          in_predicate_body = false } in
       match (try `Ok (infer env e) with Type_error m -> `Err m) with
       | `Ok te -> ((n, te) :: dacc, tyacc @ [(n, te.ty)])
       | `Err m ->
@@ -733,7 +755,8 @@ let run program =
         { env with
           fields = List.map (fun (n, t, _) -> (n, t)) resolved;
           current_domain = p.pdomain;
-          current_schema = None } in
+          current_schema = None;
+          in_predicate_body = true } in
       let result = with_diag p.ppos (fun () ->
         let tbody = check body_env p.pbody TBool in
         { tp_name   = key;
