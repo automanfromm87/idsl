@@ -55,14 +55,24 @@ let mke pos endpos node = { e_node = node; e_pos = pos; e_endpos = endpos }
    is here so we stop sprinkling 8 / 16 / 0 magic numbers around. *)
 let new_table () : ('a, 'b) Hashtbl.t = Hashtbl.create 16
 
-type example =
-  | ExLit  of literal
-  | ExEnum of ident list
-  | ExList of expr list
+(* A raw field declaration. At least one of `fd_ty` / `fd_sample` must
+   be Some; the parser never emits both None. When `fd_ty` is missing
+   the type is inferred from the sample; when `fd_sample` is missing
+   the field is type-only with no displayed example. *)
+type field_decl = {
+  fd_ty     : ty_annot option;
+  fd_sample : expr option;
+}
 
-type field =
-  | FRaw     of pos * ident * example
+and field =
+  | FRaw     of pos * ident * field_decl
   | FDerived of pos * ident * expr
+
+and ty_annot =
+  | AnnScalar of string             (* Int / Money / Bool / String / Date / Float *)
+  | AnnEnum   of string list        (* {NDA, MSA, DPA} *)
+  | AnnList   of ty_annot           (* [T] *)
+  | AnnSchema of string             (* user-defined schema name *)
 
 (* `domain : ident option` on every decl: None = top-level (global),
    Some d = declared inside a `domain d:` block. The pipeline uses this
@@ -117,11 +127,6 @@ type test_def = {
 }
 
 type action_param = { pname : ident; ptype : ty_annot; ppos : pos }
-and ty_annot =
-  | AnnScalar of string                 (* Int / Money / Bool / String / Date / Float *)
-  | AnnEnum   of string list            (* like red, yellow, green *)
-  | AnnList   of ty_annot
-  | AnnSchema of string                 (* user-defined schema name *)
 
 type action_sig = {
   asname    : ident;

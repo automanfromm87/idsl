@@ -55,10 +55,31 @@ let check_list_element env ~domain where e =
   | EIsMissing _ | EIsPresent _ | ECall _ | EField _ -> ()
 
 let check_field env ~domain schema_name = function
-  | FRaw (_pos, fname, ExList es) ->
+  | FRaw (_pos, fname, decl) ->
       let where = Printf.sprintf "schema %s.%s" schema_name fname in
-      List.iter (check_list_element env ~domain where) es
-  | FRaw _ | FDerived _ -> ()
+      (* Sample-side schema refs: `e.g. [Foo]` lowers to an EList of
+         EVars; each one must resolve to a known schema in scope. *)
+      (match decl.fd_sample with
+       | Some { e_node = EList es; _ } ->
+           List.iter (check_list_element env ~domain where) es
+       | _ -> ());
+      (* Annotation-side schema refs: `[Foo]` and `Foo` (when Foo is
+         user-defined) need the same resolution. *)
+      let rec check_ty = function
+        | AnnList t -> check_ty t
+        | AnnScalar s | AnnSchema s ->
+            (* Skip built-ins; check user-defined schema names. *)
+            (match s with
+             | "Int" | "Float" | "Bool" | "String"
+             | "Money" | "Date" | "Duration" -> ()
+             | _ when not (resolve_schema env ~domain s) ->
+                 report env ~pos:_pos
+                   (Printf.sprintf "%s: unknown type %S" where s)
+             | _ -> ())
+        | AnnEnum _ -> ()
+      in
+      Option.iter check_ty decl.fd_ty
+  | FDerived _ -> ()
 
 let validate_program env program =
   List.iter (fun s ->

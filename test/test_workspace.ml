@@ -153,7 +153,7 @@ schema Contract:
 instance Party Alpha:
   Name = "Alpha"
 
-@action notify(level: {Low|High})
+@action notify(level: {Low, High})
 
 rule R on Contract:
   when:
@@ -355,7 +355,7 @@ let test_rename_records_pos_fname () =
 let test_call_item_records_pos_fname () =
   setup_tmpdir ();
   let path_actions = write_file ~name:"actions.idsl"
-    ~content:"@action notify(level: {Low|High})\n" in
+    ~content:"@action notify(level: {Low, High})\n" in
   let path_main = write_file ~name:"main.idsl"
     ~content:{|include "actions.idsl"
 

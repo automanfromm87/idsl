@@ -7,8 +7,8 @@
 # ── action signatures ──────────────────────────────────────────────────
 # When declared, every call is arity- and type-checked at compile time.
 
-@action flag(severity: {info|warn|alert}, reason: String)
-@action route(channel: {ground|air|express|freight})
+@action flag(severity: {info, warn, alert}, reason: String)
+@action route(channel: {ground, air, express, freight})
 @action notify(team: String)
 
 # ── reusable schemas ───────────────────────────────────────────────────
@@ -37,7 +37,7 @@ instance Carrier USPS:
 
 schema Order:
   - ID:             e.g. "ORD-1001"
-  - Tier:           e.g. Standard, Priority, Express
+  - Tier:           {Standard, Priority, Express}
   - OriginCountry:  e.g. "US"
   - DestCountry:    e.g. "JP"
   - PlacedDate:     e.g. 2025-01-15

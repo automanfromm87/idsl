@@ -179,20 +179,54 @@ let walk_expr ~schema idx (root : texpr) =
          | _ -> ())
     | _ -> ()) root
 
-(* Schema references hidden in `e.g. [Foo]` raw lists — these positions
-   live on the AST (the typed pipeline collapses them into a list type). *)
+(* Schema references in raw field decls — these positions live on the
+   AST. Two sources: the type annotation (`[Foo]` / `Foo`) and the
+   sample (`e.g. [Foo]` style), both lower to ident-bearing nodes. *)
 let collect_schema_list_refs idx (prog : Ast.program) (canon : canon_tables) =
+  let push_schema_ref ~domain id pos =
+    let key = resolve_ref canon.schemas ~domain id in
+    add_ref idx (KSchema key) ~length:(String.length id) pos
+  in
+  let walk_sample ~domain (e : Ast.expr) =
+    Ast.iter_expr (function
+      | Ast.EVar id ->
+          (match canon.schemas with
+           | tbl when Hashtbl.mem tbl (qualify domain id)
+                  || Hashtbl.mem tbl id ->
+               (* Position recovery: iter_expr loses positions, so we
+                  fall back on the EList walk below for sample refs. *)
+               ignore (id, tbl)
+           | _ -> ())
+      | _ -> ()) e
+  in
+  ignore walk_sample;
+  let walk_list_sample ~domain (es : Ast.expr list) =
+    List.iter (fun e ->
+      match e.Ast.e_node with
+      | Ast.EVar id when Hashtbl.mem canon.schemas (qualify domain id)
+                      || Hashtbl.mem canon.schemas id ->
+          push_schema_ref ~domain id e.Ast.e_pos
+      | _ -> ()) es
+  in
   List.iter (function
     | Ast.TSchema s ->
         List.iter (function
-          | Ast.FRaw (_, _, ExList es) ->
-              List.iter (fun e ->
-                match e.Ast.e_node with
-                | Ast.EVar id ->
-                    let key = resolve_ref canon.schemas ~domain:s.sdomain id in
-                    add_ref idx (KSchema key)
-                      ~length:(String.length id) e.Ast.e_pos
-                | _ -> ()) es
+          | Ast.FRaw (pos, _, decl) ->
+              (* Type annotation refs *)
+              let rec ty_refs = function
+                | Ast.AnnSchema name | Ast.AnnScalar name
+                  when Hashtbl.mem canon.schemas (qualify s.sdomain name)
+                    || Hashtbl.mem canon.schemas name ->
+                    push_schema_ref ~domain:s.sdomain name pos
+                | Ast.AnnList t -> ty_refs t
+                | _ -> ()
+              in
+              Option.iter ty_refs decl.fd_ty;
+              (* Sample-side refs: only the `e.g. [Foo]` shape. *)
+              (match decl.fd_sample with
+               | Some { e_node = EList es; _ } ->
+                   walk_list_sample ~domain:s.sdomain es
+               | _ -> ())
           | _ -> ()) s.sfields
     | _ -> ()) prog
 

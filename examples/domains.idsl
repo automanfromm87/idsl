@@ -7,7 +7,7 @@
 @version("0.0.1")
 
 # Actions are global — both domains call into them.
-@action flag(severity: {info|warn|alert}, reason: String)
+@action flag(severity: {info, warn, alert}, reason: String)
 @action notify(team: String)
 
 # Schemas at the top level (no `domain` block) are global; both

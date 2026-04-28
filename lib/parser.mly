@@ -71,10 +71,6 @@ comma_seq_ident:
   | x=IDENT { [g x] }
   | x=IDENT c=COMMA rest=comma_seq_ident { g x :: g c :: rest }
 
-pipe_seq_ident:
-  | x=IDENT { [g x] }
-  | x=IDENT p=PIPE rest=pipe_seq_ident { g x :: g p :: rest }
-
 dot_seq_ident:
   | x=IDENT { [g x] }
   | x=IDENT d=DOT rest=dot_seq_ident { g x :: g d :: rest }
@@ -143,7 +139,7 @@ action_param:
 ty_annot:
   | id=IDENT
     { mk Cst.NTyAnnot $startpos $endpos [g id] }
-  | lb=LBRACE xs=pipe_seq_ident rb=RBRACE
+  | lb=LBRACE xs=comma_seq_ident rb=RBRACE
     { mk Cst.NTyAnnot $startpos $endpos ([g lb] @ xs @ [g rb]) }
   | lbk=LBRACKET t=ty_annot rbk=RBRACKET
     { mk Cst.NTyAnnot $startpos $endpos [g lbk; t; g rbk] }
@@ -165,12 +161,16 @@ field_body:
     { mk Cst.NFieldBody $startpos $endpos [g eg; ex] }
   | ie=IE e=expr
     { mk Cst.NFieldBody $startpos $endpos [g ie; e] }
+  | t=ty_annot
+    { mk Cst.NFieldBody $startpos $endpos [t] }
+  | t=ty_annot eg=EG ex=example
+    { mk Cst.NFieldBody $startpos $endpos [t; g eg; ex] }
 
 example:
   | l=literal
     { mk Cst.NExample $startpos $endpos [l] }
-  | xs=comma_seq_ident
-    { mk Cst.NExample $startpos $endpos xs }
+  | id=IDENT
+    { mk Cst.NExample $startpos $endpos [g id] }
   | lb=LBRACKET es=comma_seq_green rb=RBRACKET
     { mk Cst.NExample $startpos $endpos ([g lb] @ es @ [g rb]) }
 

@@ -201,44 +201,72 @@ and lower_field (n : node) : field =
   let kids = significant n.nchildren in
   match kids with
   | GTok _dash :: GTok name :: GTok _colon :: GNode body :: _ ->
-      (* Use the name-token's position so error messages and the
-         semantic index point exactly at the field identifier. *)
       let pos = name.start in
       let body_kids = significant body.nchildren in
       (match body_kids with
-       | GTok eg :: rest when eg.kind = Cst.EgIe "e.g." ->
-           let ex = lower_example rest in
-           FRaw (pos, tok_text name, ex)
        | GTok ie :: [GNode e] when ie.kind = Cst.EgIe "i.e." ->
            FDerived (pos, tok_text name, lower_expr e)
-       | _ -> err "field body shape unrecognised")
+       | _ ->
+           FRaw (pos, tok_text name, lower_field_decl body_kids))
   | _ -> err "field shape unrecognised"
 
-and lower_example (kids : green list) : example =
-  (* The grammar wraps the whole example in a single NExample node
-     (so kids may be `[GNode {nkind = NExample; ...}]`). Descend through
-     that wrapper before pattern-matching on actual content. *)
-  let kids =
-    match kids with
-    | [GNode n] when n.nkind = NExample -> significant n.nchildren
-    | _ -> kids
+(* Field-body shapes:
+     [ty]                          — type-only annotation
+     [ty; "e.g."; sample]          — type + sample
+     ["e.g."; sample]              — sample-only, type inferred *)
+and lower_field_decl (kids : green list) : field_decl =
+  let is_eg = function GTok t -> t.kind = Cst.EgIe "e.g." | _ -> false in
+  let lower_sample = function
+    | GNode n when n.nkind = NExample -> lower_sample_node n
+    | g -> lower_expr_g g
   in
   match kids with
+  | [GNode ty] when ty.nkind = NTyAnnot ->
+      { fd_ty = Some (lower_ty_annot ty); fd_sample = None }
+  | [GNode ty; eg; sample] when ty.nkind = NTyAnnot && is_eg eg ->
+      { fd_ty = Some (lower_ty_annot ty); fd_sample = Some (lower_sample sample) }
+  | [eg; sample] when is_eg eg ->
+      { fd_ty = None; fd_sample = Some (lower_sample sample) }
+  | _ -> err "field body shape unrecognised"
+
+(* Sample-as-expression fast path: an NExample with a literal child
+   collapses to that literal; with a bracketed list it becomes an
+   EList.  Anything else falls through to the generic lower_expr_g. *)
+and lower_ty_annot (n : node) : ty_annot =
+  match significant n.nchildren with
+  | [GTok id] when is_ident_kind id.kind ->
+      AnnScalar (tok_text id)
+  | GTok lb :: _ when lb.kind = Cst.Punct "{" ->
+      let names = List.filter_map (function
+        | GTok t when is_ident_kind t.kind -> Some (tok_text t)
+        | _ -> None) (significant n.nchildren) in
+      AnnEnum names
+  | [GTok lb; GNode inner; GTok _rb] when lb.kind = Cst.Punct "[" ->
+      AnnList (lower_ty_annot inner)
+  | _ -> err "ty_annot shape"
+
+and lower_sample_node (n : node) : Ast.expr =
+  let kids = significant n.nchildren in
+  let pos = fst n.nspan in
+  let endpos = snd n.nspan in
+  match kids with
   | [GNode lit] when lit.nkind = NLiteral ->
-      ExLit (match lit.nchildren with
+      let l = match lit.nchildren with
         | [GTok t] -> lower_literal t
-        | _ -> err "literal child")
+        | _ -> err "literal child" in
+      Ast.mke pos endpos (ELit l)
   | _ ->
       let has_lbracket =
         List.exists (function GTok t -> t.kind = Cst.Punct "[" | _ -> false) kids in
       if has_lbracket then
-        let es = collect_list_elements kids in
-        ExList es
+        Ast.mke pos endpos (EList (collect_list_elements kids))
       else
-        let names = List.filter_map (function
-          | GTok t when is_ident_kind t.kind -> Some (tok_text t)
-          | _ -> None) kids in
-        ExEnum names
+        (* Bare ident sample, e.g. `e.g. NDA` — keep as an EVar; the
+           type-checker validates it against the declared type. *)
+        match kids with
+        | [GTok t] when is_ident_kind t.kind ->
+            Ast.mke pos endpos (EVar (tok_text t))
+        | _ -> err "sample shape unrecognised"
 
 let lower_schema (n : node) : schema_def =
   let kids = significant n.nchildren in
@@ -266,19 +294,6 @@ let lower_metadata (n : node) : metadata =
   | [GTok _at; GTok k; GTok _lp; GTok v; GTok _rp] ->
       { mkey = tok_text k; mvalue = tok_string_payload v }
   | _ -> err "metadata shape"
-
-let rec lower_ty_annot (n : node) : ty_annot =
-  match significant n.nchildren with
-  | [GTok id] when is_ident_kind id.kind ->
-      AnnScalar (tok_text id)
-  | GTok lb :: _ when lb.kind = Cst.Punct "{" ->
-      let names = List.filter_map (function
-        | GTok t when is_ident_kind t.kind -> Some (tok_text t)
-        | _ -> None) (significant n.nchildren) in
-      AnnEnum names
-  | [GTok lb; GNode inner; GTok _rb] when lb.kind = Cst.Punct "[" ->
-      AnnList (lower_ty_annot inner)
-  | _ -> err "ty_annot shape"
 
 let lower_action_param (n : node) : action_param =
   match significant n.nchildren with

@@ -74,20 +74,21 @@ let mkdiag ?related pos msg =
 exception Located of Lexing.position * string
 let err_at pos fmt = Printf.ksprintf (fun s -> raise (Located (pos, s))) fmt
 
-let resolve_ty_annot ?domain schemas = function
+let rec resolve_ty_annot ?domain schemas = function
   | AnnScalar "Int"    -> TInt
   | AnnScalar "Float"  -> TFloat
   | AnnScalar "Bool"   -> TBool
   | AnnScalar "String" -> TString
   | AnnScalar "Money"  -> TMoney
   | AnnScalar "Date"   -> TDate
+  | AnnScalar "Duration" -> TDuration
   | AnnScalar s ->
       let q = qualify domain s in
       if Hashtbl.mem schemas q then TSchema q
       else if Hashtbl.mem schemas s then TSchema s
       else err "unknown type %s" s
   | AnnEnum xs   -> TEnum xs
-  | AnnList _    -> err "list type annotations not yet supported in @action"
+  | AnnList t    -> TList (resolve_ty_annot ?domain schemas t)
   | AnnSchema s  ->
       let q = qualify domain s in
       if Hashtbl.mem schemas q then TSchema q
@@ -307,25 +308,29 @@ and check_object_fits env s kvs =
 
 (* ---------- schemas ---------- *)
 
-let infer_example ?domain schemas = function
-  | ExLit l     -> infer_lit l, `Lit l
-  | ExEnum tags ->
-      if tags = [] then err "empty enum"
-      else TEnum tags, `Enum tags
-  | ExList es ->
-      let base = make_env schemas
-        (Hashtbl.create 0) (Hashtbl.create 0) in
-      let env = { base with current_domain = domain } in
-      let tes = List.map (infer env) es in
-      let elem = List.fold_left (fun acc te -> unify acc te.ty) TAny tes in
-      TList elem, `List tes
+(* Resolve a raw field's type from its declaration: explicit annotation
+   wins; otherwise infer from the sample expression (which the parser
+   guarantees is present whenever no annotation was supplied). *)
+let infer_field_type ?domain schemas (decl : field_decl) : Types.ty =
+  let env =
+    let base = make_env schemas (Hashtbl.create 0) (Hashtbl.create 0) in
+    { base with current_domain = domain }
+  in
+  match decl.fd_ty, decl.fd_sample with
+  | None, None        -> err "field has neither type nor sample"
+  | None, Some e      -> (infer env e).ty
+  | Some ty, None     -> resolve_ty_annot ?domain schemas ty
+  | Some ty, Some e   ->
+      let resolved = resolve_ty_annot ?domain schemas ty in
+      let _ = check env e resolved in   (* raises Type_error on mismatch *)
+      resolved
 
 let typecheck_schema schemas actions sch =
   let errors = ref [] in
   let push d = errors := d :: !errors in
   let raw_pairs = List.filter_map (function
-    | FRaw (pos, n, ex) ->
-        (try Some (n, fst (infer_example ?domain:sch.sdomain schemas ex))
+    | FRaw (pos, n, decl) ->
+        (try Some (n, infer_field_type ?domain:sch.sdomain schemas decl)
          with Type_error m ->
            push (mkdiag pos
              (Printf.sprintf "schema %s.%s: %s" sch.sname n m));

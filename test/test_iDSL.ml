@@ -60,10 +60,29 @@ let () =
   assert_ok "raw schema fields"
     {|schema C:
   - ID: e.g. 123
-  - Kind: e.g. NDA, MSA, DPA
+  - Kind: {NDA, MSA, DPA}
   - V: e.g. $5,000,000
   - D: e.g. 2025-01-15
   - B: e.g. true
+|};
+
+  assert_tc_ok "type-only field annotation (no e.g.)"
+    {|schema C:
+  - Amount: Money
+  - Kind:   {NDA, MSA}
+  - Items:  [Int]
+|};
+
+  assert_tc_ok "type annotation + e.g. sample"
+    {|schema C:
+  - Amount: Money e.g. $50
+  - Kind:   {NDA, MSA} e.g. NDA
+|};
+
+  assert_tc_err "type annot rejects mismatched sample"
+    "type mismatch"
+    {|schema C:
+  - Amount: Money e.g. true
 |};
 
   assert_resolve_ok "list literal of schema ref"
@@ -121,7 +140,7 @@ schema Contract:
 
   assert_tc_ok "tc: well-typed schema + rule"
     {|schema C:
-  - Kind: e.g. NDA, MSA
+  - Kind: {NDA, MSA}
   - IsLong: i.e. true
 rule r.x:
   when:
@@ -133,7 +152,7 @@ rule r.x:
 
   assert_tc_err "tc: enum tag not in declared set" "tag `FOO`"
     {|schema C:
-  - Kind: e.g. NDA, MSA
+  - Kind: {NDA, MSA}
 rule r.x:
   when:
     Kind == FOO
@@ -167,7 +186,7 @@ schema C:
 
   assert_tc_err "tc: test assigns wrong-typed value" "type mismatch"
     {|schema C:
-  - Kind: e.g. NDA, MSA
+  - Kind: {NDA, MSA}
 test "bad":
   given C:
     Kind = 42

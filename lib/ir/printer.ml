@@ -43,13 +43,21 @@ let rec pp_expr e =
   | ECall (f, args) ->
       Printf.sprintf "%s(%s)" f (String.concat ", " (List.map pp_expr args))
 
-let pp_example = function
-  | ExLit l   -> pp_lit l
-  | ExEnum xs -> String.concat ", " xs
-  | ExList es -> "[" ^ String.concat ", " (List.map pp_expr es) ^ "]"
+let rec pp_ty_annot = function
+  | AnnScalar s -> s
+  | AnnEnum xs  -> "{" ^ String.concat ", " xs ^ "}"
+  | AnnList t   -> "[" ^ pp_ty_annot t ^ "]"
+  | AnnSchema s -> s
+
+let pp_field_decl (d : field_decl) =
+  match d.fd_ty, d.fd_sample with
+  | Some ty, Some s -> Printf.sprintf "%s e.g. %s" (pp_ty_annot ty) (pp_expr s)
+  | Some ty, None   -> pp_ty_annot ty
+  | None, Some s    -> Printf.sprintf "e.g. %s" (pp_expr s)
+  | None, None      -> "<missing>"
 
 let pp_field = function
-  | FRaw (_, n, ex)    -> Printf.sprintf "  - %s: e.g. %s" n (pp_example ex)
+  | FRaw (_, n, d)     -> Printf.sprintf "  - %s: %s" n (pp_field_decl d)
   | FDerived (_, n, e) -> Printf.sprintf "  - %s: i.e. %s" n (pp_expr e)
 
 let indent_lines prefix xs =
