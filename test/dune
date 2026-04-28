@@ -5,7 +5,12 @@
 
 (test
  (name test_workspace)
- (libraries iDSL unix))
+ (libraries iDSL unix str)
+ (deps ../bin/idsl_lsp.exe))
+
+(test
+ (name test_domain_identity)
+ (libraries iDSL threads.posix))
 
 (test
  (name test_properties)

@@ -1,22 +1,16 @@
 (* Semantic index — a flat map "Symbol.t → declaration site + reference
    sites" derived from the AST and typed AST.
 
-   This is intentionally minimal. It's the smallest model that lets
-   textDocument/references and a symbol-id-based textDocument/definition
-   work; it will grow as the consumers (rename, references-with-tail-of-
-   path, codeAction) demand.
+   Identity model: every Symbol.kind carries a *canonical qualified*
+   name (e.g. "shipping.Item").  Two same-bare-name decls in different
+   `domain` blocks therefore produce distinct symbols.  Reference sites
+   are recorded under the same canonical key — so when typed expressions
+   carry `TSchema "shipping.Item"` (because typecheck canonicalized
+   them), we can look them up directly without re-resolving here.
 
-   Known omissions today (each documents a position that the AST/Typed
-   tree does not currently carry):
-     - The schema name in `rule X on Foo:` — `rule.rschema` is a bare
-       string; we record the rule's pos but cannot mark "Foo" specifically.
-     - The schema name in `test "x" on Foo:` and `instance Foo X:`.
-     - The field name on the right of a path expression (`clause.Kind`):
-       `TPath` carries only the receiver's pos, not the field's.
-
-   Each of those is a follow-up that requires plumbing positions into
-   either Ast or the typed elaboration. References for the above slots
-   simply won't appear in the index until then. *)
+   The bare token text is stored on Symbol.t (`decl_name`) and is what
+   range / span computations consume — using the qualified key as a
+   length would overshoot the real source token. *)
 
 open Typed
 
@@ -30,6 +24,14 @@ type ref_site = {
   pos    : Lexing.position;
   length : int;             (* approximate span length; used for end-pos *)
 }
+
+(* Length of a declaration's bare source token. Tests cover the +2 case
+   (surrounding quotes around test names). *)
+let decl_token_length (s : Symbol.t) : int =
+  match s.kind with
+  | KTest _ -> String.length s.decl_name + 2
+  | KSchema _ | KInstance _ | KAction _ | KField _ | KRule _ ->
+      String.length s.decl_name
 
 type t = {
   symbols : Symbol.t SymTable.t;
@@ -49,87 +51,115 @@ let add_ref idx (kind : Symbol.kind) ?(length = 1) (p : Lexing.position) =
   let cur = try SymTable.find idx.refs kind with Not_found -> [] in
   SymTable.replace idx.refs kind ({ pos = p; length } :: cur)
 
-(* ---------- collect declarations from AST ----------
+(* Bare names at reference sites (`include`-side type lists, instance
+   heads, `given Schema:`, etc.) are resolved against the canonical key
+   the index uses via the same helper the typechecker uses, so the two
+   layers can never disagree on what "shipping.Item" means. *)
+let qualify = Typecheck.qualify
+let resolve_ref = Typecheck.resolve_key
 
-   After the binder pass, every declaration carries its identifier's
-   position directly in the AST — there's no CST traversal here anymore.
-   The `_root` argument is retained so the call site signature is stable
-   while we hand the CST to future binder-pass extensions (e.g.
-   action-param symbols, which still rely on CST tokens). *)
+type canon_tables = {
+  schemas   : (string, unit) Hashtbl.t;
+  instances : (string, unit) Hashtbl.t;
+  actions   : (string, unit) Hashtbl.t;
+}
 
-(* Domain-qualified name: "shipping.Order" inside `domain shipping:`,
-   or just "Order" at the top level.  Symbol.kind reuses its existing
-   string slot to hold the qualified form, so two same-bare-name decls
-   in different domains produce distinct Symbol values. *)
-let qualify (dom : Ast.ident option) (name : Ast.ident) : Ast.ident =
-  match dom with Some d -> d ^ "." ^ name | None -> name
+let collect_canon_tables (prog : Ast.program) : canon_tables =
+  let schemas   = Ast.new_table () in
+  let instances = Ast.new_table () in
+  let actions   = Ast.new_table () in
+  List.iter (function
+    | Ast.TSchema s ->
+        Hashtbl.replace schemas (qualify s.sdomain s.sname) ()
+    | Ast.TInstance i ->
+        Hashtbl.replace instances (qualify i.idomain i.iname) ()
+    | Ast.TAction a ->
+        Hashtbl.replace actions (qualify a.asdomain a.asname) ()
+    | Ast.TRule _ | Ast.TTest _ | Ast.TMeta _ | Ast.TInclude _ -> ())
+    prog;
+  { schemas; instances; actions }
+
+(* ---------- collect declarations from AST ---------- *)
 
 let collect_decls idx (prog : Ast.program) (_root : Cst.node) =
-  let mk kind pos label_kind =
+  let mk kind ~bare pos label_kind =
     add_symbol idx
-      { kind; decl_pos = pos; label = Symbol.label_of_kind label_kind } in
+      { kind; decl_pos = pos; decl_name = bare;
+        label = Symbol.label_of_kind label_kind } in
   List.iter (function
     | Ast.TSchema s ->
         let q = qualify s.sdomain s.sname in
         let k = Symbol.KSchema q in
-        mk k s.spos k;
+        mk k ~bare:s.sname s.spos k;
         List.iter (fun f ->
           let pos, name = match f with
             | Ast.FRaw (p, n, _)     -> p, n
             | Ast.FDerived (p, n, _) -> p, n in
           let k = Symbol.KField (q, name) in
-          mk k pos k) s.sfields
+          mk k ~bare:name pos k) s.sfields
     | Ast.TRule r ->
         let pos = match r.rpath_locs with p :: _ -> p | [] -> r.rpos in
         let path = match r.rdomain with
           | Some d -> d :: r.rpath
           | None   -> r.rpath in
+        let bare = match r.rpath with x :: _ -> x | [] -> "" in
         let k = Symbol.KRule path in
-        mk k pos k
+        mk k ~bare pos k
     | Ast.TTest t ->
         let q = qualify t.tdomain t.tname in
         let k = Symbol.KTest q in
-        mk k t.tpos k
+        (* +2 covers the surrounding quotes around the test name. *)
+        mk k ~bare:t.tname t.tpos k
     | Ast.TInstance i ->
         let q = qualify i.idomain i.iname in
         let k = Symbol.KInstance q in
-        mk k i.iname_pos k
+        mk k ~bare:i.iname i.iname_pos k
     | Ast.TAction a ->
         let q = qualify a.asdomain a.asname in
         let k = Symbol.KAction q in
-        mk k a.aspos k
+        mk k ~bare:a.asname a.aspos k
     | Ast.TMeta _ | Ast.TInclude _ -> ()) prog
 
 (* Schema references that live in declaration heads (not inside typed
    expressions) — they aren't reachable from `collect_typed_refs`. *)
-let collect_decl_refs idx (prog : Ast.program) =
+let collect_decl_refs idx (prog : Ast.program) (canon : canon_tables) =
   List.iter (function
     | Ast.TInstance i ->
-        add_ref idx (KSchema i.ischema)
+        let key = resolve_ref canon.schemas ~domain:i.idomain i.ischema in
+        add_ref idx (KSchema key)
           ~length:(String.length i.ischema) i.ischema_pos
     | Ast.TRule r ->
         (match r.rschema, r.rschema_pos with
          | Some s, Some p ->
-             add_ref idx (KSchema s) ~length:(String.length s) p
+             let key = resolve_ref canon.schemas ~domain:r.rdomain s in
+             add_ref idx (KSchema key) ~length:(String.length s) p
          | _ -> ())
     | Ast.TTest t ->
         let g = t.tgiven in
-        add_ref idx (KSchema g.gschema)
+        let key = resolve_ref canon.schemas ~domain:t.tdomain g.gschema in
+        add_ref idx (KSchema key)
           ~length:(String.length g.gschema) g.gschema_pos
     | _ -> ()) prog
 
 (* `instance Foo X:\n  Field = …` and the `given` block of a test both
    produce `field_assign` records whose LHS is a field reference. *)
-let collect_field_assign_refs idx (prog : Ast.program) =
-  let push schema (a : Ast.field_assign) =
-    add_ref idx (KField (schema, a.aname))
+let collect_field_assign_refs idx (prog : Ast.program) (canon : canon_tables) =
+  let push schema_key (a : Ast.field_assign) =
+    add_ref idx (KField (schema_key, a.aname))
       ~length:(String.length a.aname) a.aname_pos in
   List.iter (function
-    | Ast.TInstance i -> List.iter (push i.ischema) i.ivalues
-    | Ast.TTest t     -> List.iter (push t.tgiven.gschema) t.tgiven.gvalues
+    | Ast.TInstance i ->
+        let key = resolve_ref canon.schemas ~domain:i.idomain i.ischema in
+        List.iter (push key) i.ivalues
+    | Ast.TTest t ->
+        let key = resolve_ref canon.schemas ~domain:t.tdomain t.tgiven.gschema in
+        List.iter (push key) t.tgiven.gvalues
     | _ -> ()) prog
 
-(* ---------- collect references from typed expressions ---------- *)
+(* ---------- collect references from typed expressions ----------
+
+   `~schema` is the canonical key (qualified) — typecheck has already
+   resolved it before storing it on tr_schema / tg_schema / ti_schema. *)
 
 let walk_expr ~schema idx (root : texpr) =
   iter_expr (fun (e : texpr) ->
@@ -141,9 +171,7 @@ let walk_expr ~schema idx (root : texpr) =
     | TCall (name, _) ->
         add_ref idx (KAction name) ~length:(String.length name) e.pos
     | TPath (recv, fpos, fname) ->
-        (* `clause.Kind` — the field name's pos is now plumbed; we
-           classify it against the receiver's static type so the index
-           knows which schema's field is being referenced. *)
+        (* recv.ty is the canonical schema key after typecheck. *)
         (match recv.ty with
          | Types.TSchema sname ->
              add_ref idx (KField (sname, fname))
@@ -153,7 +181,7 @@ let walk_expr ~schema idx (root : texpr) =
 
 (* Schema references hidden in `e.g. [Foo]` raw lists — these positions
    live on the AST (the typed pipeline collapses them into a list type). *)
-let collect_schema_list_refs idx (prog : Ast.program) =
+let collect_schema_list_refs idx (prog : Ast.program) (canon : canon_tables) =
   List.iter (function
     | Ast.TSchema s ->
         List.iter (function
@@ -161,7 +189,8 @@ let collect_schema_list_refs idx (prog : Ast.program) =
               List.iter (fun e ->
                 match e.Ast.e_node with
                 | Ast.EVar id ->
-                    add_ref idx (KSchema id)
+                    let key = resolve_ref canon.schemas ~domain:s.sdomain id in
+                    add_ref idx (KSchema key)
                       ~length:(String.length id) e.Ast.e_pos
                 | _ -> ()) es
           | _ -> ()) s.sfields
@@ -173,8 +202,6 @@ let collect_typed_refs idx (tp : tprogram) =
       | TFRaw _ -> ()
       | TFDerived (_, body) -> walk_expr ~schema:s.ts_name idx body)
       s.ts_fields) tp.schemas;
-  (* Top-level `then:` / `expect:` calls — `tcall` now carries the call
-     name's position, so we can index the action ref accurately. *)
   List.iter (fun (r : trule) ->
     List.iter (walk_expr ~schema:r.tr_schema idx) r.tr_when;
     List.iter (fun ((cpos, name, args) : tcall) ->
@@ -199,10 +226,11 @@ let collect_typed_refs idx (tp : tprogram) =
 
 let build (prog : Ast.program) (tp : tprogram) (cst : Cst.node) : t =
   let idx = create () in
+  let canon = collect_canon_tables prog in
   collect_decls idx prog cst;
-  collect_schema_list_refs idx prog;
-  collect_decl_refs idx prog;
-  collect_field_assign_refs idx prog;
+  collect_schema_list_refs idx prog canon;
+  collect_decl_refs idx prog canon;
+  collect_field_assign_refs idx prog canon;
   collect_typed_refs idx tp;
   idx
 
@@ -243,11 +271,6 @@ let symbol_at idx ~line ~col : Symbol.t option =
       match acc with
       | Some _ -> acc
       | None ->
-        let len = match s.kind with
-          | KSchema n | KInstance n | KAction n -> String.length n
-          | KField (_, n) -> String.length n
-          | KRule p -> String.length (String.concat "." p)
-          | KTest n -> String.length n + 2 (* quotes *)
-        in
+        let len = decl_token_length s in
         if pos_covers s.decl_pos ~line ~col len then Some s else None)
       idx.symbols None

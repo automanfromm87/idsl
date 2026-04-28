@@ -29,6 +29,7 @@ type t = {
   mutable folders            : string list;
   config                     : (string, string) Hashtbl.t;
   mutable folder_scan_cache  : string list option;
+  mutable on_remove          : (uri:string -> unit) list;
 }
 
 let create () : t = {
@@ -39,7 +40,15 @@ let create () : t = {
   folders           = [];
   config            = Hashtbl.create 8;
   folder_scan_cache = None;
+  on_remove         = [];
 }
+
+(* Subscribers fire whenever a doc is removed (didClose, watched-file
+   delete). External caches that mirror per-doc data — `last_good` in
+   the LSP binary, for example — register here so they don't grow
+   unbounded as the user opens / closes files over a long session. *)
+let on_remove ws (cb : uri:string -> unit) =
+  ws.on_remove <- cb :: ws.on_remove
 
 (* Folder-scan results are stable until folders change or watched files
    announce a create/delete. Centralizing the invalidation here keeps
@@ -54,16 +63,88 @@ let folders ws = ws.folders
 let set_config ws ~key ~value = Hashtbl.replace ws.config key value
 let get_config ws ~key = Hashtbl.find_opt ws.config key
 
-(* ---------- URI ↔ path ---------- *)
+(* ---------- URI ↔ path ----------
 
+   Real LSP clients send RFC 3986 file URIs: percent-encoded, sometimes
+   with an authority component (`file://localhost/...`), sometimes
+   without (`file:///...`). Naive prefix stripping breaks on every one
+   of: spaces (`%20`), unicode (`%E4%BE%8B`), the `localhost` authority
+   form, and `#` fragments / `?` queries (which the protocol shouldn't
+   send but bridges sometimes append). *)
+
+let hex_digit c =
+  match c with
+  | '0'..'9' -> Some (Char.code c - Char.code '0')
+  | 'a'..'f' -> Some (Char.code c - Char.code 'a' + 10)
+  | 'A'..'F' -> Some (Char.code c - Char.code 'A' + 10)
+  | _ -> None
+
+let percent_decode (s : string) : string =
+  let n = String.length s in
+  let b = Buffer.create n in
+  let i = ref 0 in
+  while !i < n do
+    let c = s.[!i] in
+    if c = '%' && !i + 2 < n then begin
+      match hex_digit s.[!i + 1], hex_digit s.[!i + 2] with
+      | Some hi, Some lo ->
+          Buffer.add_char b (Char.chr (hi lsl 4 lor lo));
+          i := !i + 3
+      | _ ->
+          Buffer.add_char b c; incr i
+    end else begin
+      Buffer.add_char b c; incr i
+    end
+  done;
+  Buffer.contents b
+
+(* Per RFC 3986: unreserved = ALPHA / DIGIT / "-" / "." / "_" / "~",
+   plus "/" preserved as a path separator. Everything else encoded. *)
+let percent_encode_path (s : string) : string =
+  let n = String.length s in
+  let b = Buffer.create (n + 8) in
+  String.iter (fun c ->
+    let safe = match c with
+      | 'A'..'Z' | 'a'..'z' | '0'..'9'
+      | '-' | '.' | '_' | '~' | '/' -> true
+      | _ -> false
+    in
+    if safe then Buffer.add_char b c
+    else Buffer.add_string b (Printf.sprintf "%%%02X" (Char.code c))) s;
+  Buffer.contents b
+
+(* Strip the scheme and an optional authority, percent-decode the path,
+   and drop any `?query` / `#fragment` we shouldn't ever receive but
+   sometimes do via bridge layers. *)
 let path_of_uri (uri : string) : string =
-  if String.length uri > 7 && String.sub uri 0 7 = "file://"
-  then String.sub uri 7 (String.length uri - 7)
+  let drop_after_first_of (s : string) (chars : char list) : string =
+    let len = String.length s in
+    let stop = ref len in
+    String.iteri (fun i c ->
+      if !stop = len && List.mem c chars then stop := i) s;
+    String.sub s 0 !stop
+  in
+  let scheme = "file://" in
+  let scheme_len = String.length scheme in
+  if String.length uri >= scheme_len
+     && String.sub uri 0 scheme_len = scheme
+  then begin
+    let rest = String.sub uri scheme_len (String.length uri - scheme_len) in
+    let path =
+      (* `file://localhost/...` and `file:///...` both denote the local
+         host; an authority is everything up to the next `/`. *)
+      match String.index_opt rest '/' with
+      | Some 0 -> rest                                 (* file:///abs *)
+      | Some i -> String.sub rest i (String.length rest - i)
+      | None   -> "/" ^ rest                           (* file://host *)
+    in
+    percent_decode (drop_after_first_of path ['?'; '#'])
+  end
   else uri
 
 let uri_of_path (p : string) : string =
   if String.length p > 0 && p.[0] = '/'
-  then "file://" ^ p
+  then "file://" ^ percent_encode_path p
   else p
 
 (* Map a `Lexing.position.pos_fname` into a `file://` URI, falling back
@@ -97,6 +178,21 @@ let put_doc ws ~uri ~content ~version =
   | None ->
       Hashtbl.add ws.docs uri { uri; content; version }
 
+(* Monotonic version guard.  Equal versions are accepted as idempotent
+   re-deliveries; strictly older ones are rejected with the current
+   version so the caller can log and ignore. *)
+let put_doc_versioned ws ~uri ~content ~version
+    : [`Updated | `Stale of int] =
+  match Hashtbl.find_opt ws.docs uri with
+  | Some d when version < d.version -> `Stale d.version
+  | Some d ->
+      d.content <- content;
+      d.version <- version;
+      `Updated
+  | None ->
+      Hashtbl.add ws.docs uri { uri; content; version };
+      `Updated
+
 let remove_doc ws ~uri =
   Hashtbl.remove ws.docs uri;
   Hashtbl.remove ws.cache uri;
@@ -104,7 +200,8 @@ let remove_doc ws ~uri =
   (* clean rdeps lists that pointed at us *)
   Hashtbl.iter (fun u xs ->
     let kept = List.filter (fun v -> v <> uri) xs in
-    Hashtbl.replace ws.rdeps u kept) ws.rdeps
+    Hashtbl.replace ws.rdeps u kept) ws.rdeps;
+  List.iter (fun cb -> cb ~uri) ws.on_remove
 
 let get_doc ws ~uri = Hashtbl.find_opt ws.docs uri
 
@@ -134,6 +231,23 @@ let set_deps ws ~uri ~includes =
 
 let dependents_of ws ~uri =
   try Hashtbl.find ws.rdeps uri with Not_found -> []
+
+(* Drop compile-cache entries for every URI that isn't currently open
+   in the editor. Open buffers are authoritative (every didChange
+   invalidates them); closed-doc cache entries can only be trusted when
+   we're confident nothing has touched them on disk — exactly the
+   guarantee we lose when watcher registration fails. The next request
+   re-compiles those files, so semantic state catches up with disk
+   without us needing to know which file actually changed. *)
+let drop_closed_doc_cache ws : unit =
+  let to_drop = Hashtbl.fold (fun uri _ acc ->
+    if Hashtbl.mem ws.docs uri then acc else uri :: acc) ws.cache [] in
+  List.iter (fun uri ->
+    Hashtbl.remove ws.cache uri;
+    Hashtbl.remove ws.deps uri;
+    Hashtbl.iter (fun u xs ->
+      let kept = List.filter (fun v -> v <> uri) xs in
+      Hashtbl.replace ws.rdeps u kept) ws.rdeps) to_drop
 
 (* ---------- cache invalidation ----------
 
@@ -210,28 +324,61 @@ let compile_all ws : (string * Session.t) list =
 (* Walk every workspace folder for *.idsl files. Result is cached on
    the workspace; `invalidate_folder_scan` (called from `set_folders`
    and from didChangeWatchedFiles handler) flushes it. *)
-let is_dir p = try Sys.is_directory p with _ -> false
+(* Defensive cap so a hostile / pathological tree can't run unbounded
+   even with the cycle guard in place (very deep but non-cyclic trees
+   can still stall a single-threaded server). *)
+let max_scan_depth = 64
 
 let scan_folder_files ws : string list =
   match ws.folder_scan_cache with
   | Some xs -> xs
   | None ->
     let out = ref [] in
-    let rec walk dir =
-      match Sys.readdir dir with
-      | exception _ -> ()
-      | entries ->
-          Array.iter (fun name ->
-            if String.length name > 0 && name.[0] = '.' then ()
-            else
-              let full = Filename.concat dir name in
-              if is_dir full then walk full
-              else if Filename.check_suffix name ".idsl" then
-                out := full :: !out) entries
+    (* Identity by (device, inode) so symlinks pointing at an already-
+       visited directory don't recurse forever; works for both intra-
+       tree symlinks and cross-mount cycles. *)
+    let visited : (int * int, unit) Hashtbl.t = Hashtbl.create 64 in
+    let rec walk dir depth =
+      if depth > max_scan_depth then ()
+      else
+        match Unix.lstat dir with
+        | exception Unix.Unix_error _ -> ()
+        | st when st.st_kind <> Unix.S_DIR -> ()
+        | st ->
+            let key = (st.st_dev, st.st_ino) in
+            if Hashtbl.mem visited key then ()
+            else begin
+              Hashtbl.add visited key ();
+              match Sys.readdir dir with
+              | exception _ -> ()
+              | entries ->
+                  Array.iter (fun name ->
+                    if String.length name > 0 && name.[0] = '.' then ()
+                    else
+                      let full = Filename.concat dir name in
+                      match Unix.lstat full with
+                      | exception Unix.Unix_error _ -> ()
+                      | est when est.st_kind = Unix.S_DIR ->
+                          walk full (depth + 1)
+                      | est when est.st_kind = Unix.S_LNK ->
+                          (* Resolve and recurse only if it points at a
+                             *directory* — file symlinks can't cycle. *)
+                          (match Unix.stat full with
+                           | exception Unix.Unix_error _ -> ()
+                           | tst when tst.st_kind = Unix.S_DIR ->
+                               walk full (depth + 1)
+                           | tst when tst.st_kind = Unix.S_REG
+                                   && Filename.check_suffix name ".idsl" ->
+                               out := full :: !out
+                           | _ -> ())
+                      | est when est.st_kind = Unix.S_REG
+                              && Filename.check_suffix name ".idsl" ->
+                          out := full :: !out
+                      | _ -> ()) entries
+            end
     in
     List.iter (fun folder_uri ->
-      let dir = path_of_uri folder_uri in
-      if is_dir dir then walk dir) ws.folders;
+      walk (path_of_uri folder_uri) 0) ws.folders;
     let result = List.sort_uniq compare !out in
     ws.folder_scan_cache <- Some result;
     result
@@ -253,6 +400,25 @@ let all_known_uris ws : string list =
    answer covers files the editor hasn't opened yet. *)
 let compile_all_known ws : (string * Session.t) list =
   List.map (fun uri -> uri, compile_doc ws ~uri) (all_known_uris ws)
+
+type fs_change = Created | Changed | Deleted
+
+(* Apply one `workspace/didChangeWatchedFiles` entry, returning the
+   open-in-editor parents the caller should re-analyze.  The Deleted
+   case is non-trivial: when a file is open in the editor we keep the
+   in-memory text authoritative; when it isn't, we snapshot dependents
+   *before* `remove_doc` cleans up the rdeps edges, so open parents
+   still get notified that their include just vanished. *)
+let handle_watched_change ws ~uri ~change : string list =
+  invalidate_folder_scan ws;
+  let open_parents = List.filter (fun u -> Hashtbl.mem ws.docs u) in
+  match change with
+  | Deleted when not (Hashtbl.mem ws.docs uri) ->
+      let deps = dependents_of ws ~uri in
+      remove_doc ws ~uri;
+      open_parents deps
+  | Created | Changed | Deleted ->
+      open_parents (invalidate ws ~uri)
 
 (* Aggregate references for a symbol across the local session and the
    *transitive* reverse-dependency closure.  This is what makes find-

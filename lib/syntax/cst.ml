@@ -39,39 +39,78 @@ type tok = {
   trailing : trivia list;      (* in source order *)
 }
 
-(* Pending trivia accumulates here until consumed as `leading` by the
-   next significant token. *)
-let pending_leading : trivia list ref = ref []
-let buf : tok list ref = ref []
+(* Per-parse mutable state. Owned by `with_state`, swapped in/out under
+   `parse_mutex` so concurrent callers serialize at the parse boundary
+   instead of trashing each other's token snapshot. *)
 
-let reset () =
-  pending_leading := [];
-  buf := []
+type state = {
+  mutable pending_leading : trivia list;
+  mutable buf             : tok list;
+}
+
+let make_state () : state = { pending_leading = []; buf = [] }
+
+let current : state option ref = ref None
+let parse_mutex : Mutex.t = Mutex.create ()
+
+let with_state (f : unit -> 'a) : 'a * tok list =
+  Mutex.lock parse_mutex;
+  let prev = !current in
+  let s = make_state () in
+  current := Some s;
+  Fun.protect
+    ~finally:(fun () ->
+      current := prev;
+      Mutex.unlock parse_mutex)
+    (fun () ->
+       let r = f () in
+       (r, List.rev s.buf))
+
+let active_state () : state =
+  match !current with
+  | Some s -> s
+  | None ->
+      failwith "Cst: no active parse state — call sites must run \
+                inside Cst.with_state"
+
+(* Per-parse state replaces the old explicit reset; kept as a no-op so
+   the lexer's call site doesn't need to change. *)
+let reset () = ()
 
 let add_trivia kind lexbuf =
+  let s = active_state () in
   let text = Lexing.lexeme lexbuf in
   let pos  = Lexing.lexeme_start_p lexbuf in
-  pending_leading := { trk_kind = kind; trk_text = text; trk_pos = pos }
-                    :: !pending_leading
+  s.pending_leading <-
+    { trk_kind = kind; trk_text = text; trk_pos = pos } :: s.pending_leading
 
 let take_leading () =
-  let xs = List.rev !pending_leading in
-  pending_leading := [];
+  let s = active_state () in
+  let xs = List.rev s.pending_leading in
+  s.pending_leading <- [];
   xs
 
 let make_token lexbuf kind =
+  let s = active_state () in
   let start = Lexing.lexeme_start_p lexbuf in
   let stop  = Lexing.lexeme_end_p   lexbuf in
   let text  = Lexing.lexeme         lexbuf in
   let t = { kind; start; stop; text;
             leading = take_leading ();
             trailing = [] } in
-  buf := t :: !buf;
+  s.buf <- t :: s.buf;
   t
 
-let push t = buf := t :: !buf
+let push t =
+  let s = active_state () in
+  s.buf <- t :: s.buf
 
-let snapshot () = List.rev !buf
+(* Push a pre-built trivia record onto the active state's pending list.
+   Used by error recovery to preserve bytes that didn't match any
+   lexer production. *)
+let push_trivia (t : trivia) =
+  let s = active_state () in
+  s.pending_leading <- t :: s.pending_leading
 
 type node_kind =
   | NProgram

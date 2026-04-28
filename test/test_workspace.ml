@@ -606,6 +606,385 @@ domain billing:
   check "[dom-x] cross-domain reference is rejected"
     (s.diagnostics <> [])
 
+(* ---------- Test 14: didChange semantics — empty buffers + version order ---- *)
+
+(* Regression for two long-life-server bugs:
+
+   - Emptying the buffer (Ctrl-A + Delete) is a legitimate edit;
+     `put_doc_versioned` must accept an empty content, not silently
+     discard it.
+
+   - Out-of-order didChange notifications (re-deliveries via plugin
+     bridges, proxy retries) must not roll the document back: a smaller
+     incoming version is stale and must be rejected.  Equal versions
+     are idempotent re-deliveries and may be re-applied without harm. *)
+let test_versioned_put_doc () =
+  let ws = Workspace.create () in
+  let uri = "file:///tmp/v_test.idsl" in
+  (match Workspace.put_doc_versioned ws ~uri ~content:"schema A:\n  - K: e.g. 1\n"
+           ~version:1 with
+   | `Updated -> check "[ver] initial put accepted" true
+   | `Stale _ -> check "[ver] initial put accepted" false);
+
+  (* Newer version overwrites. *)
+  (match Workspace.put_doc_versioned ws ~uri ~content:"schema B:\n  - K: e.g. 1\n"
+           ~version:5 with
+   | `Updated -> check "[ver] newer put accepted" true
+   | `Stale _ -> check "[ver] newer put accepted" false);
+  let cur1 = match Workspace.get_doc ws ~uri with
+    | Some d -> d.content | None -> "" in
+  check "[ver] doc holds the v=5 content"
+    (cur1 = "schema B:\n  - K: e.g. 1\n");
+
+  (* Stale (older) version is dropped. *)
+  (match Workspace.put_doc_versioned ws ~uri ~content:"schema STALE:\n  - K: e.g. 1\n"
+           ~version:2 with
+   | `Stale n -> check "[ver] stale put rejected (current=5)" (n = 5)
+   | `Updated -> check "[ver] stale put rejected" false);
+  let cur2 = match Workspace.get_doc ws ~uri with
+    | Some d -> d.content | None -> "" in
+  check "[ver] stale put did not overwrite"
+    (cur2 = "schema B:\n  - K: e.g. 1\n");
+
+  (* Empty content at a newer version is a *legitimate* edit
+     (regression: the bin used to skip empty `updated`). *)
+  (match Workspace.put_doc_versioned ws ~uri ~content:""
+           ~version:6 with
+   | `Updated -> check "[ver] empty content accepted at v=6" true
+   | `Stale _ -> check "[ver] empty content accepted at v=6" false);
+  let cur3 = match Workspace.get_doc ws ~uri with
+    | Some d -> d.content | None -> "" in
+  check "[ver] empty content stored verbatim"
+    (cur3 = "")
+
+(* ---------- Test 15: doc-removal hooks fire on remove_doc ---- *)
+
+(* `last_good` and similar per-doc caches in the LSP binary subscribe
+   via `Workspace.on_remove`; a missed callback keeps stale typed
+   programs alive forever and grows the table without bound. *)
+let test_remove_hook_fires () =
+  let ws = Workspace.create () in
+  let removed = ref [] in
+  Workspace.on_remove ws (fun ~uri -> removed := uri :: !removed);
+  let uri = "file:///tmp/hook_test.idsl" in
+  Workspace.put_doc ws ~uri ~content:"schema A:\n  - K: e.g. 1\n" ~version:1;
+  let _ = Workspace.compile_doc ws ~uri in
+  Workspace.remove_doc ws ~uri;
+  check "[hook] on_remove fired with the closed URI"
+    (!removed = [uri]);
+  check "[hook] doc table no longer holds the URI"
+    (Workspace.get_doc ws ~uri = None)
+
+(* ---------- Test 16: watched-file delete preserves open docs --------- *)
+
+(* Two long-running-server failure modes that the new
+   `Workspace.handle_watched_change` is meant to prevent:
+
+   - `delete` on a path the editor still has open should NOT erase the
+     in-memory doc.  The disk delete is irrelevant when the buffer is
+     authoritative; throwing away the doc would also strand every
+     dependent file.
+
+   - `delete` on a path that is *not* open must still notify open
+     parents so they re-publish diagnostics for the now-missing
+     include — dependents are snapshotted before remove_doc runs. *)
+let test_watched_delete_preserves_open_docs () =
+  setup_tmpdir ();
+  let path_a = write_file ~name:"a.idsl"
+    ~content:"schema Inner:\n  - K: e.g. 1\n" in
+  let path_main = write_file ~name:"main.idsl"
+    ~content:"include \"a.idsl\"\n\nschema Outer:\n  - I: e.g. [Inner]\n" in
+  let ws = Workspace.create () in
+  let main_uri = "file://" ^ path_main in
+  let a_uri    = "file://" ^ path_a in
+  Workspace.put_doc ws ~uri:main_uri ~content:(read_file path_main) ~version:1;
+  Workspace.put_doc ws ~uri:a_uri    ~content:(read_file path_a)    ~version:1;
+  let _ = Workspace.compile_doc ws ~uri:main_uri in
+
+  (* Simulate a disk delete of a.idsl *while* the editor still has it
+     open. The in-memory doc is authoritative. *)
+  let to_publish =
+    Workspace.handle_watched_change ws ~uri:a_uri ~change:Workspace.Deleted in
+  check "[wd] open doc survives disk-delete notification"
+    (Workspace.get_doc ws ~uri:a_uri <> None);
+  check "[wd] dependent main is in the re-publish set"
+    (List.mem main_uri to_publish);
+
+  teardown ()
+
+let test_watched_delete_unopened_notifies_dependents () =
+  setup_tmpdir ();
+  let path_a = write_file ~name:"a.idsl"
+    ~content:"schema Inner:\n  - K: e.g. 1\n" in
+  let path_main = write_file ~name:"main.idsl"
+    ~content:"include \"a.idsl\"\n\nschema Outer:\n  - I: e.g. [Inner]\n" in
+  let ws = Workspace.create () in
+  let main_uri = "file://" ^ path_main in
+  let a_uri    = "file://" ^ path_a in
+  (* Only main is opened; a.idsl is closed but on disk. *)
+  Workspace.put_doc ws ~uri:main_uri ~content:(read_file path_main) ~version:1;
+  let _ = Workspace.compile_doc ws ~uri:main_uri in
+
+  (* Sanity: dep edge exists pre-delete. *)
+  check "[wd2] dep edge registered"
+    (List.mem main_uri (Workspace.dependents_of ws ~uri:a_uri));
+
+  let to_publish =
+    Workspace.handle_watched_change ws ~uri:a_uri ~change:Workspace.Deleted in
+  check "[wd2] closed file's doc entry is removed"
+    (Workspace.get_doc ws ~uri:a_uri = None);
+  check "[wd2] open dependent main is still in publish set"
+    (List.mem main_uri to_publish);
+  ignore path_a;
+  teardown ()
+
+(* ---------- Test 17+18: subprocess-driven LSP protocol coverage ----- *)
+
+let lsp_bin =
+  let candidates = [
+    "../bin/idsl_lsp.exe";
+    "_build/default/bin/idsl_lsp.exe";
+    "bin/idsl_lsp.exe";
+  ] in
+  List.find_opt Sys.file_exists candidates
+
+let frame body =
+  Printf.sprintf "Content-Length: %d\r\n\r\n%s"
+    (String.length body) body
+
+let init_msg = frame
+  {|{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}|}
+let exit_msg = frame
+  {|{"jsonrpc":"2.0","method":"exit","params":null}|}
+
+let contains haystack needle =
+  try
+    let _ = Str.search_forward (Str.regexp_string needle) haystack 0 in
+    true
+  with Not_found -> false
+
+let id_match n =
+  Printf.sprintf "\"id\"[ \t]*:[ \t]*%d" n
+
+let contains_re haystack pat =
+  try let _ = Str.search_forward (Str.regexp pat) haystack 0 in true
+  with Not_found -> false
+
+(* Spawn the LSP, feed `input`, return stdout. stderr is redirected to
+   `/dev/null` so the child can never block on a full stderr pipe (the
+   server logs every bad frame and exception, which adds up fast). *)
+let collect_responses ~bin ~input ~deadline_s : string =
+  let in_r,  in_w  = Unix.pipe () in
+  let out_r, out_w = Unix.pipe () in
+  let dev_null = Unix.openfile "/dev/null" [O_WRONLY] 0 in
+  let pid = Unix.create_process bin [| bin |] in_r out_w dev_null in
+  Unix.close in_r;
+  Unix.close out_w;
+  Unix.close dev_null;
+  let in_oc = Unix.out_channel_of_descr in_w in
+  output_string in_oc input;
+  close_out in_oc;
+  let buf = Buffer.create 4096 in
+  let chunk = Bytes.create 4096 in
+  let deadline = Unix.gettimeofday () +. deadline_s in
+  let rec drain () =
+    if Unix.gettimeofday () > deadline then ()
+    else
+      let r, _, _ = Unix.select [out_r] [] [] 0.5 in
+      if r = [] then drain ()
+      else
+        match Unix.read out_r chunk 0 (Bytes.length chunk) with
+        | 0 -> ()
+        | n -> Buffer.add_subbytes buf chunk 0 n; drain ()
+        | exception _ -> ()
+  in
+  drain ();
+  let _ = Unix.waitpid [] pid in
+  Unix.close out_r;
+  Buffer.contents buf
+
+let with_lsp ~tag ~input ~deadline_s f =
+  match lsp_bin with
+  | None -> check (tag ^ " LSP binary present") false
+  | Some bin -> f (collect_responses ~bin ~input ~deadline_s)
+
+(* A truncated body would steal bytes from subsequent frames and isn't
+   recoverable in any LSP server, so we don't exercise it here. *)
+let test_lsp_framing_survives_bad_frames () =
+  let bad_negative = "Content-Length: -7\r\n\r\n" in
+  let bad_huge     = "Content-Length: 999999999999\r\n\r\n" in
+  let bad_json     = frame "{not json" in
+  let input = bad_negative ^ bad_huge ^ bad_json ^ init_msg ^ exit_msg in
+  with_lsp ~tag:"[frame]" ~input ~deadline_s:5.0 (fun out ->
+    check "[frame] server survived bad frames and responded to initialize"
+      (contains_re out (id_match 1)))
+
+let test_lsp_method_not_found () =
+  let unknown = frame
+    {|{"jsonrpc":"2.0","id":42,"method":"textDocument/totallyMadeUp","params":{}}|} in
+  with_lsp ~tag:"[mnf]"
+    ~input:(init_msg ^ unknown ^ exit_msg) ~deadline_s:5.0 (fun out ->
+    check "[mnf] server returned an error envelope for unknown method"
+      (contains out "-32601");
+    check "[mnf] error response carries the original request id (42)"
+      (contains_re out (id_match 42)))
+
+let test_lsp_shutdown_gates_requests () =
+  let shutdown = frame
+    {|{"jsonrpc":"2.0","id":2,"method":"shutdown","params":null}|} in
+  let post = frame
+    {|{"jsonrpc":"2.0","id":3,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":"file:///x.idsl"}}}|} in
+  with_lsp ~tag:"[sg]"
+    ~input:(init_msg ^ shutdown ^ post ^ exit_msg) ~deadline_s:5.0 (fun out ->
+    check "[sg] post-shutdown request gets -32600"
+      (contains out "-32600");
+    check "[sg] post-shutdown error envelope carries id 3"
+      (contains_re out (id_match 3)))
+
+(* Client refuses dynamic registration; workspace/symbol must still
+   succeed (server falls back to per-request rescans). *)
+let test_lsp_watcher_rejection_does_not_crash () =
+  let initialized = frame
+    {|{"jsonrpc":"2.0","method":"initialized","params":{}}|} in
+  let reg_error = frame
+    {|{"jsonrpc":"2.0","id":"watcher-registration","error":{"code":-32601,"message":"dynamic registration not supported"}}|} in
+  let ws_sym = frame
+    {|{"jsonrpc":"2.0","id":99,"method":"workspace/symbol","params":{"query":""}}|} in
+  let input = init_msg ^ initialized ^ reg_error ^ ws_sym ^ exit_msg in
+  with_lsp ~tag:"[wr]" ~input ~deadline_s:5.0 (fun out ->
+    check "[wr] server kept processing after watcher rejection"
+      (contains_re out (id_match 99));
+    check "[wr] server did not emit an internal-error for the rejection"
+      (not (contains out "-32603")))
+
+(* ---------- Test 19: URI encoding round-trips ----------
+
+   Real LSP clients send file URIs with percent-encoding, an optional
+   `localhost` authority, and (rarely, via bridges) a trailing fragment
+   or query.  All four must decode to the same path the workspace uses
+   internally; the encode side has to round-trip through decode. *)
+let test_uri_encoding () =
+  let cases = [
+    "file:///tmp/plain.idsl",                   "/tmp/plain.idsl";
+    "file:///tmp/My%20Spec.idsl",               "/tmp/My Spec.idsl";
+    "file:///tmp/%E4%BE%8B.idsl",               "/tmp/\xe4\xbe\x8b.idsl";
+    "file://localhost/tmp/x.idsl",              "/tmp/x.idsl";
+    "file:///tmp/x.idsl#frag",                  "/tmp/x.idsl";
+    "file:///tmp/x.idsl?q=1",                   "/tmp/x.idsl";
+  ] in
+  List.iter (fun (uri, expected) ->
+    let got = Workspace.path_of_uri uri in
+    check (Printf.sprintf "[uri] decode %s" uri)
+      (got = expected)) cases;
+  (* Encode then decode must round-trip, including non-ASCII. *)
+  let paths = [
+    "/tmp/plain.idsl";
+    "/tmp/My Spec.idsl";
+    "/tmp/\xe4\xbe\x8b.idsl";
+    "/tmp/path with #hash.idsl";
+  ] in
+  List.iter (fun p ->
+    let encoded = Workspace.uri_of_path p in
+    let decoded = Workspace.path_of_uri encoded in
+    check (Printf.sprintf "[uri] round-trip %S" p)
+      (decoded = p)) paths
+
+(* ---------- Test 20: symlink cycle protection ----------
+
+   A workspace folder containing a symlink to one of its ancestors
+   used to make scan_folder_files recurse forever (or until stack
+   overflow). Visited-set + lstat-aware traversal should walk it once
+   and stop. *)
+let test_symlink_cycle () =
+  setup_tmpdir ();
+  let outer = !tmpdir in
+  let inner = Filename.concat outer "sub" in
+  Unix.mkdir inner 0o755;
+  let _ = write_file ~name:"a.idsl"
+    ~content:"schema A:\n  - K: e.g. 1\n" in
+  let _ = write_file ~name:"sub/b.idsl"
+    ~content:"schema B:\n  - K: e.g. 1\n" in
+  (* Create a self-referential symlink: sub/loop -> ../sub *)
+  Unix.symlink "../sub" (Filename.concat inner "loop");
+
+  let ws = Workspace.create () in
+  Workspace.set_folders ws ["file://" ^ outer];
+
+  (* Without cycle protection this hangs / stack-overflows. With
+     protection it returns at most O(real files) entries. *)
+  let scanned = Workspace.scan_folder_files ws in
+  check "[cycle] scan completes despite symlink loop"
+    (List.length scanned >= 2 && List.length scanned < 100);
+  let basenames = List.map Filename.basename scanned
+                  |> List.sort_uniq compare in
+  check "[cycle] both real files surfaced"
+    (List.mem "a.idsl" basenames && List.mem "b.idsl" basenames);
+  teardown ()
+
+(* ---------- Test 21: closed-file cache invalidated when watcher fails -- *)
+
+(* The fallback for a watcher-less server isn't just "rescan the
+   folder" — closed files whose content changes on disk must also have
+   their compile cache evicted, otherwise workspace/symbol returns
+   ASTs from a Session.t that's been stale since startup. *)
+let test_drop_closed_doc_cache () =
+  setup_tmpdir ();
+  let path_a = write_file ~name:"a.idsl"
+    ~content:"schema Old:\n  - K: e.g. 1\n" in
+  let ws = Workspace.create () in
+  let a_uri = "file://" ^ path_a in
+
+  (* Compile while a.idsl is closed (no put_doc). *)
+  let s1 = Workspace.compile_doc ws ~uri:a_uri in
+  let names1 =
+    match s1.ast with
+    | Some prog -> List.map (fun s -> s.Ast.sname) (Ast.schemas prog)
+    | None -> [] in
+  check "[stale] initial compile sees Old"
+    (List.mem "Old" names1);
+
+  (* Disk changes while watcher would normally tell us; simulate the
+     watcher being unavailable by *not* invalidating manually. *)
+  let oc = open_out path_a in
+  output_string oc "schema New:\n  - K: e.g. 1\n";
+  close_out oc;
+
+  (* Without intervention, compile_doc returns the cached Old session. *)
+  let s2 = Workspace.compile_doc ws ~uri:a_uri in
+  let names2 =
+    match s2.ast with
+    | Some prog -> List.map (fun s -> s.Ast.sname) (Ast.schemas prog)
+    | None -> [] in
+  check "[stale] without invalidation, cache returns stale Old"
+    (List.mem "Old" names2);
+
+  (* drop_closed_doc_cache must force a re-compile next time. *)
+  Workspace.drop_closed_doc_cache ws;
+  let s3 = Workspace.compile_doc ws ~uri:a_uri in
+  let names3 =
+    match s3.ast with
+    | Some prog -> List.map (fun s -> s.Ast.sname) (Ast.schemas prog)
+    | None -> [] in
+  check "[stale] after drop_closed_doc_cache, re-compile sees New"
+    (List.mem "New" names3 && not (List.mem "Old" names3));
+
+  (* Open docs are *not* dropped — their in-memory text is authoritative. *)
+  let path_b = write_file ~name:"b.idsl"
+    ~content:"schema OnDisk:\n  - K: e.g. 1\n" in
+  let b_uri = "file://" ^ path_b in
+  Workspace.put_doc ws ~uri:b_uri
+    ~content:"schema InMem:\n  - K: e.g. 1\n" ~version:1;
+  let _ = Workspace.compile_doc ws ~uri:b_uri in
+  Workspace.drop_closed_doc_cache ws;
+  let s4 = Workspace.compile_doc ws ~uri:b_uri in
+  let names4 =
+    match s4.ast with
+    | Some prog -> List.map (fun s -> s.Ast.sname) (Ast.schemas prog)
+    | None -> [] in
+  check "[stale] open doc cache survives the drop"
+    (List.mem "InMem" names4);
+  teardown ()
+
 let () =
   Printf.printf "\n--- workspace regressions ---\n";
   test_multifile_include ();
@@ -621,5 +1000,16 @@ let () =
   test_document_symbol_only_local_file ();
   test_domain_scopes_same_name ();
   test_domain_blocks_cross_reference ();
+  test_versioned_put_doc ();
+  test_remove_hook_fires ();
+  test_watched_delete_preserves_open_docs ();
+  test_watched_delete_unopened_notifies_dependents ();
+  test_lsp_framing_survives_bad_frames ();
+  test_lsp_method_not_found ();
+  test_lsp_shutdown_gates_requests ();
+  test_lsp_watcher_rejection_does_not_crash ();
+  test_uri_encoding ();
+  test_symlink_cycle ();
+  test_drop_closed_doc_cache ();
   Printf.printf "%d passed, %d failed\n" !pass !fail;
   if !fail > 0 then exit 1

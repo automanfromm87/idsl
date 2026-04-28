@@ -29,18 +29,18 @@ let parse_diag pos msg =
    populated — even on failure it is at least a flat `NError` over the
    tokens we managed to lex. *)
 let parse_lexbuf lexbuf : (Ast.program, Diagnostic.t) result * Cst.tok list * Cst.node =
-  Lexer.reset ();
-  let cst_or_err =
-    try Ok (Parser.program Lexer.token lexbuf)
-    with
-    | Lexer.Lex_error msg ->
-        Error (parse_diag (Lexing.lexeme_start_p lexbuf) msg)
-    | Parser.Error ->
-        let p = Lexing.lexeme_start_p lexbuf in
-        Error (parse_diag p
-                 (Printf.sprintf "parse error at token %S" (Lexing.lexeme lexbuf)))
+  let cst_or_err, tokens =
+    Cst.with_state (fun () ->
+      Lexer.reset ();
+      try Ok (Parser.program Lexer.token lexbuf)
+      with
+      | Lexer.Lex_error msg ->
+          Error (parse_diag (Lexing.lexeme_start_p lexbuf) msg)
+      | Parser.Error ->
+          let p = Lexing.lexeme_start_p lexbuf in
+          Error (parse_diag p
+                   (Printf.sprintf "parse error at token %S" (Lexing.lexeme lexbuf))))
   in
-  let tokens = Cst.snapshot () in
   match cst_or_err with
   | Ok (Cst.GNode root) ->
       let result =
@@ -64,28 +64,28 @@ let parse_lexbuf lexbuf : (Ast.program, Diagnostic.t) result * Cst.tok list * Cs
    regression caught by the property suite. *)
 let cst_of_failed_source (s : string) : Cst.tok list * Cst.node =
   let lb = Lexing.from_string s in
-  Lexer.reset ();
-  let rec drain () =
-    match Lexer.token lb with
-    | EOF _ -> ()
-    | _ -> drain ()
-    | exception _ ->
-        (* The lexer's catch-all `_` rule matched one byte and then
-           raised; ocamllex has already advanced lex_curr_pos past it,
-           so lex_start_pos points at the byte we want to preserve. *)
-        if lb.lex_start_pos < lb.lex_buffer_len then begin
-          let bad =
-            Bytes.sub_string lb.lex_buffer lb.lex_start_pos 1 in
-          Cst.pending_leading :=
-            { Cst.trk_kind = Whitespace;
-              trk_text = bad;
-              trk_pos  = lb.lex_start_p;
-            } :: !Cst.pending_leading;
-          drain ()
-        end
+  let (), tokens = Cst.with_state (fun () ->
+    Lexer.reset ();
+    let rec drain () =
+      match Lexer.token lb with
+      | EOF _ -> ()
+      | _ -> drain ()
+      | exception _ ->
+          (* The lexer's catch-all `_` rule matched one byte and then
+             raised; ocamllex has already advanced lex_curr_pos past it,
+             so lex_start_pos points at the byte we want to preserve. *)
+          if lb.lex_start_pos < lb.lex_buffer_len then begin
+            let bad =
+              Bytes.sub_string lb.lex_buffer lb.lex_start_pos 1 in
+            Cst.push_trivia
+              { Cst.trk_kind = Whitespace;
+                trk_text = bad;
+                trk_pos  = lb.lex_start_p; };
+            drain ()
+          end
+    in
+    drain ())
   in
-  drain ();
-  let tokens = Cst.snapshot () in
   (tokens, Cst.flat_tree tokens)
 
 let extract_includes (prog : Ast.program) : string list =

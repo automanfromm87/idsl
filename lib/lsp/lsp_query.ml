@@ -164,10 +164,12 @@ let symbol_name = function
   | Symbol.KRule path    -> String.concat "." path
   | Symbol.KTest n       -> n
 
+let decl_token_length = Semantic_index.decl_token_length
+
 (* Range that covers exactly the declared name token. *)
 let name_range_of (sym : Symbol.t) : sym_range =
   let p = pos_lsp_of_lex sym.decl_pos in
-  let len = String.length (symbol_name sym.kind) in
+  let len = decl_token_length sym in
   { sr_start = p; sr_end = { p with character = p.character + len } }
 
 (* Block range from a CST node's span. *)
@@ -285,7 +287,7 @@ let document_highlights_at (idx : Semantic_index.t) (cursor : lsp_pos)
   match Semantic_index.symbol_at idx ~line:cursor.line ~col:cursor.character with
   | None -> None
   | Some s ->
-      let decl_len = String.length (symbol_name s.kind) in
+      let decl_len = decl_token_length s in
       let refs = Semantic_index.references_of idx s in
       let pairs =
         List.map (fun (r : Semantic_index.ref_site) -> r.pos, r.length) refs in
@@ -457,7 +459,9 @@ let signature_help_at (tp : Typed.tprogram) (cst : Cst.tok list)
                       (cursor : lsp_pos) : signature_help option =
   match enclosing_call cst ~line:cursor.line ~col:cursor.character with
   | Some (name, ix) ->
-    (match List.find_opt (fun (a : Typed.taction) -> a.ta_name = name) tp.actions with
+    (match List.find_opt
+       (fun (a : Typed.taction) -> a.ta_name = name || a.ta_bare = name)
+       tp.actions with
      | None -> None
      | Some a ->
        let head = name ^ "(" in
@@ -723,7 +727,7 @@ let rename_at ?refs (idx : Semantic_index.t) (cursor : lsp_pos)
     match Semantic_index.symbol_at idx ~line:cursor.line ~col:cursor.character with
     | None -> None
     | Some s ->
-        let decl_len = String.length (symbol_name s.kind) in
+        let decl_len = decl_token_length s in
         let decl_edit = edit_for_pos ~pos:s.decl_pos ~length:decl_len
                                      ~new_text:new_name in
         let ref_sites = match refs with
@@ -1059,7 +1063,7 @@ let unused_diagnostics (idx : Semantic_index.t) : (Lexing.position * int * strin
        if not consider then None
        else if Semantic_index.references_of idx s <> [] then None
        else
-         let len = String.length (symbol_name s.kind) in
+         let len = decl_token_length s in
          let msg = Printf.sprintf "%s is never used" s.label in
          Some (s.decl_pos, len, msg))
 
@@ -1296,11 +1300,20 @@ let find_field tp name =
       | None -> ()) tp.Typed.schemas;
   !r
 
+(* Lenient lookup by canonical key OR bare token. Hover / completion
+   gets bare names from the user's cursor; the typed program now stores
+   qualified keys. Match either form so domain-scoped decls remain
+   reachable from completion paths that don't yet thread domain
+   context. *)
 let find_schema tp name =
-  List.find_opt (fun s -> s.Typed.ts_name = name) tp.Typed.schemas
+  List.find_opt
+    (fun s -> s.Typed.ts_name = name || s.Typed.ts_bare = name)
+    tp.Typed.schemas
 
 let find_instance tp name =
-  List.find_opt (fun (i : Typed.tinstance) -> i.ti_name = name) tp.instances
+  List.find_opt
+    (fun (i : Typed.tinstance) -> i.ti_name = name || i.ti_bare = name)
+    tp.instances
 
 let mk_comp ?detail ?insert_text ?(snippet = false) ?data_id label kind =
   { c_label = label; c_kind = kind; c_detail = detail;
@@ -1453,7 +1466,9 @@ let complete_after_dot tp recv =
     | None -> []
 
 let complete_call_arg (tp : Typed.tprogram) call arg_ix =
-  match List.find_opt (fun (a : Typed.taction) -> a.ta_name = call) tp.actions with
+  match List.find_opt
+    (fun (a : Typed.taction) -> a.ta_name = call || a.ta_bare = call)
+    tp.actions with
   | None -> []
   | Some a ->
       if arg_ix >= List.length a.ta_params then []
@@ -1618,15 +1633,7 @@ let def_at (idx : Semantic_index.t) (cursor : lsp_pos)
   | None -> None
   | Some s -> Some (s.decl_pos, s.label)
 
-let decl_length (k : Symbol.kind) =
-  match k with
-  | KSchema n | KInstance n | KAction n -> String.length n
-  | KField (_, n) -> String.length n
-  | KRule p       -> String.length (String.concat "." p)
-  (* +2 covers the surrounding `"…"` that frames a test's name in the
-     source — the user clicks past either quote and still expects to
-     hit the test symbol. *)
-  | KTest n       -> String.length n + 2
+let decl_length = decl_token_length
 
 (* References for the symbol the cursor is on, including its declaration
    so the LSP "Find All References" list always has the decl as item 0.
@@ -1645,7 +1652,7 @@ let references_at ?refs (idx : Semantic_index.t) (cursor : lsp_pos)
       let ref_pairs =
         List.map (fun (r : Semantic_index.ref_site) -> r.pos, r.length)
           ref_sites in
-      Some ((s.decl_pos, decl_length s.kind) :: ref_pairs)
+      Some ((s.decl_pos, decl_length s) :: ref_pairs)
 
 (* Round-7 protocol aliases. *)
 let declaration_at = def_at

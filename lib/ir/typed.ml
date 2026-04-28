@@ -41,8 +41,16 @@ type tfield =
   | TFRaw     of ident * Types.ty
   | TFDerived of ident * texpr
 
+(* `ts_name` is the *canonical* identity used by every downstream
+   consumer (Eval, Semantic_index, LSP) — it equals "domain.bare" when
+   the schema is declared under a `domain` block, and just "bare"
+   otherwise. `ts_bare` is preserved separately so range / hover code
+   can recover the source-token text without re-parsing the qualified
+   string. `ts_domain` is the lexical domain (None = top-level). *)
 type tschema = {
   ts_name   : ident;
+  ts_bare   : ident;
+  ts_domain : ident option;
   ts_fields : tfield list;
   ts_types  : (ident * Types.ty) list;
 }
@@ -54,14 +62,14 @@ type tcall = Ast.pos * ident * texpr list
 type trule = {
   tr_path     : ident list;
   tr_desc     : string option;
-  tr_schema   : ident;
+  tr_schema   : ident;          (* canonical schema key *)
   tr_priority : int;
   tr_when     : texpr list;
   tr_then     : tcall list;
 }
 
 type tgiven = {
-  tg_schema : ident;
+  tg_schema : ident;            (* canonical schema key *)
   tg_values : (ident * texpr) list;
 }
 
@@ -70,19 +78,22 @@ type texpectation =
   | TMustNot of tcall
 
 type ttest = {
-  tt_name   : string;
+  tt_name   : string;          (* canonical: "domain.<bare test name>" *)
+  tt_bare   : string;          (* bare test-name string from source *)
   tt_given  : tgiven;
   tt_expect : texpectation list;
 }
 
 type tinstance = {
-  ti_name   : ident;
-  ti_schema : ident;
+  ti_name   : ident;           (* canonical instance key *)
+  ti_bare   : ident;           (* bare token at the instance declaration *)
+  ti_schema : ident;           (* canonical schema key *)
   ti_values : (ident * texpr) list;
 }
 
 type taction = {
-  ta_name   : ident;
+  ta_name   : ident;           (* canonical @action key *)
+  ta_bare   : ident;           (* bare action name from source *)
   ta_params : (ident * Types.ty) list;
   ta_pos    : Ast.pos;
 }
@@ -220,7 +231,7 @@ let pp_instance i =
   let body = String.concat "\n"
     (List.map (fun (k, v) ->
        Printf.sprintf "  %s = %s" k (pp_expr v)) i.ti_values) in
-  Printf.sprintf "instance %s %s:\n%s" i.ti_schema i.ti_name body
+  Printf.sprintf "instance %s %s:\n%s" i.ti_schema i.ti_bare body
 
 let pp_program tp =
   let parts =

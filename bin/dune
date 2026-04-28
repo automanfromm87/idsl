@@ -1,4 +1,4 @@
 (executables
  (public_names iDSL idsl-lsp)
  (names main idsl_lsp)
- (libraries iDSL str))
+ (libraries iDSL str unix))

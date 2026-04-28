@@ -3,14 +3,26 @@ open Parser
 
 exception Lex_error of string
 
-let paren_depth = ref 0
-let at_eof = ref false
+(* Per-parse state, swapped on each `Lexer.reset` and serialized via
+   `Cst.with_state`'s mutex so concurrent parses don't corrupt each
+   other. *)
+type state = {
+  mutable paren_depth : int;
+  mutable at_eof      : bool;
+  mutable last_token  : token;
+}
 
 let dummy_tok () = {
   Cst.kind = Cst.Eof; start = Lexing.dummy_pos; stop = Lexing.dummy_pos;
   text = ""; leading = []; trailing = [];
 }
-let last_token : token ref = ref (EOF (dummy_tok ()))
+
+let make_state () : state =
+  { paren_depth = 0;
+    at_eof      = false;
+    last_token  = EOF (dummy_tok ()) }
+
+let current : state ref = ref (make_state ())
 
 let is_keyword = function
   | "schema" | "rule" | "when" | "then" | "if" | "else"
@@ -34,7 +46,7 @@ let is_continuation = function
     -> true
   | _ -> false
 
-let emit t = last_token := t; t
+let emit t = (!current).last_token <- t; t
 
 (* Emit a significant token: build a Cst.tok with currently-pending
    leading trivia, then wrap it as the menhir terminal. *)
@@ -45,10 +57,9 @@ let emit_log lexbuf cst_kind wrap =
 let add_trivia kind lexbuf =
   Cst.add_trivia kind lexbuf
 
+(* Install a fresh state at the start of each parse_lexbuf. *)
 let reset () =
-  paren_depth := 0;
-  at_eof := false;
-  last_token := EOF (dummy_tok ());
+  current := make_state ();
   Cst.reset ()
 }
 
@@ -68,10 +79,11 @@ rule token = parse
   | ws+                         { add_trivia Whitespace   lexbuf; token lexbuf }
   | '\n' {
       Lexing.new_line lexbuf;
-      if !paren_depth > 0 then begin
+      let st = !current in
+      if st.paren_depth > 0 then begin
         add_trivia Newline lexbuf;     (* suppressed inside parens → trivia *)
         token lexbuf
-      end else if is_continuation !last_token then begin
+      end else if is_continuation st.last_token then begin
         add_trivia Newline lexbuf;     (* continuation after binop → trivia *)
         token lexbuf
       end else
@@ -140,19 +152,20 @@ rule token = parse
   | '/'                         { emit_log lexbuf (Op "/") (fun ct -> SLASH ct) }
   | ':'                         { emit_log lexbuf (Punct ":") (fun ct -> COLON ct) }
   | ','                         { emit_log lexbuf (Punct ",") (fun ct -> COMMA ct) }
-  | '('                         { incr paren_depth; emit_log lexbuf (Punct "(") (fun ct -> LPAREN ct) }
-  | ')'                         { decr paren_depth; emit_log lexbuf (Punct ")") (fun ct -> RPAREN ct) }
-  | '['                         { incr paren_depth; emit_log lexbuf (Punct "[") (fun ct -> LBRACKET ct) }
-  | ']'                         { decr paren_depth; emit_log lexbuf (Punct "]") (fun ct -> RBRACKET ct) }
-  | '{'                         { incr paren_depth; emit_log lexbuf (Punct "{") (fun ct -> LBRACE ct) }
-  | '}'                         { decr paren_depth; emit_log lexbuf (Punct "}") (fun ct -> RBRACE ct) }
+  | '('                         { (!current).paren_depth <- (!current).paren_depth + 1; emit_log lexbuf (Punct "(") (fun ct -> LPAREN ct) }
+  | ')'                         { (!current).paren_depth <- (!current).paren_depth - 1; emit_log lexbuf (Punct ")") (fun ct -> RPAREN ct) }
+  | '['                         { (!current).paren_depth <- (!current).paren_depth + 1; emit_log lexbuf (Punct "[") (fun ct -> LBRACKET ct) }
+  | ']'                         { (!current).paren_depth <- (!current).paren_depth - 1; emit_log lexbuf (Punct "]") (fun ct -> RBRACKET ct) }
+  | '{'                         { (!current).paren_depth <- (!current).paren_depth + 1; emit_log lexbuf (Punct "{") (fun ct -> LBRACE ct) }
+  | '}'                         { (!current).paren_depth <- (!current).paren_depth - 1; emit_log lexbuf (Punct "}") (fun ct -> RBRACE ct) }
   | '.'                         { emit_log lexbuf (Punct ".") (fun ct -> DOT ct) }
   | '@'                         { emit_log lexbuf (Punct "@") (fun ct -> AT ct) }
   | '|'                         { emit_log lexbuf (Punct "|") (fun ct -> PIPE ct) }
   | eof {
-      if !at_eof then emit_log lexbuf Eof (fun ct -> EOF ct)
+      let st = !current in
+      if st.at_eof then emit_log lexbuf Eof (fun ct -> EOF ct)
       else begin
-        at_eof := true;
+        st.at_eof <- true;
         let dummy = { Cst.kind = Newline; start = Lexing.lexeme_start_p lexbuf;
                       stop = Lexing.lexeme_end_p lexbuf; text = "";
                       leading = []; trailing = [] } in

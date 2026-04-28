@@ -29,28 +29,41 @@ let make_env ?(strict_calls = false) schemas actions instances =
 let qualify (dom : ident option) (name : ident) : ident =
   match dom with Some d -> d ^ "." ^ name | None -> name
 
-let scoped_find (tbl : (ident, 'a) Hashtbl.t) (env : env) (name : ident)
-    : 'a option =
+(* `scoped_find_canon` returns both the canonical key the table is
+   using and the value, in one pass — call sites that need both
+   (most of them) avoid a redundant second lookup. *)
+let scoped_find_canon (tbl : (ident, 'a) Hashtbl.t) (env : env) (name : ident)
+    : (ident * 'a) option =
   match env.current_domain with
-  | None   -> Hashtbl.find_opt tbl name
+  | None ->
+      (match Hashtbl.find_opt tbl name with
+       | Some v -> Some (name, v) | None -> None)
   | Some d ->
-      (match Hashtbl.find_opt tbl (d ^ "." ^ name) with
-       | Some _ as r -> r
-       | None        -> Hashtbl.find_opt tbl name)
+      let q = d ^ "." ^ name in
+      (match Hashtbl.find_opt tbl q with
+       | Some v -> Some (q, v)
+       | None ->
+           match Hashtbl.find_opt tbl name with
+           | Some v -> Some (name, v)
+           | None -> None)
 
-let scoped_mem (tbl : (ident, 'a) Hashtbl.t) (env : env) (name : ident)
-    : bool =
-  scoped_find tbl env name <> None
+let scoped_find tbl env name =
+  Option.map snd (scoped_find_canon tbl env name)
 
-(* Resolve a bare cross-table reference at *storage* time (env not yet
-   built).  Returns the canonical qualified key the table currently
-   uses; falls back to the qualified-with-domain form when neither
-   bucket is populated, so the later type-check raises a clean
-   "unknown" error. *)
+let scoped_mem tbl env name = scoped_find_canon tbl env name <> None
+
+(* Canonical key the table actually uses.  Tries qualified-by-domain
+   first, falls back to bare; on miss returns the qualified form so
+   downstream lookups raise a clean "unknown" rather than aliasing
+   into a foreign domain. *)
 let resolve_key tbl ~domain name =
-  if Hashtbl.mem tbl (qualify domain name) then qualify domain name
+  let q = qualify domain name in
+  if Hashtbl.mem tbl q then q
   else if Hashtbl.mem tbl name then name
-  else qualify domain name
+  else q
+
+let scoped_canon_key tbl env name =
+  resolve_key tbl ~domain:env.current_domain name
 
 let mkdiag ?related pos msg =
   Diagnostic.error ?related ~stage:Diagnostic.Typecheck ~pos msg
@@ -61,7 +74,7 @@ let mkdiag ?related pos msg =
 exception Located of Lexing.position * string
 let err_at pos fmt = Printf.ksprintf (fun s -> raise (Located (pos, s))) fmt
 
-let resolve_ty_annot schemas = function
+let resolve_ty_annot ?domain schemas = function
   | AnnScalar "Int"    -> TInt
   | AnnScalar "Float"  -> TFloat
   | AnnScalar "Bool"   -> TBool
@@ -69,11 +82,16 @@ let resolve_ty_annot schemas = function
   | AnnScalar "Money"  -> TMoney
   | AnnScalar "Date"   -> TDate
   | AnnScalar s ->
-      if Hashtbl.mem schemas s then TSchema s
+      let q = qualify domain s in
+      if Hashtbl.mem schemas q then TSchema q
+      else if Hashtbl.mem schemas s then TSchema s
       else err "unknown type %s" s
   | AnnEnum xs   -> TEnum xs
   | AnnList _    -> err "list type annotations not yet supported in @action"
-  | AnnSchema s  -> TSchema s
+  | AnnSchema s  ->
+      let q = qualify domain s in
+      if Hashtbl.mem schemas q then TSchema q
+      else TSchema s
 
 let mk pos node ty = { node; ty; pos }
 
@@ -92,8 +110,8 @@ let resolve_var env id =
     match List.assoc_opt id env.fields with
     | Some t -> Some (VarField id, t)
     | None ->
-      match scoped_find env.instances env id with
-      | Some sname -> Some (VarInstance id, TSchema sname)
+      match scoped_find_canon env.instances env id with
+      | Some (canon, sname) -> Some (VarInstance canon, TSchema sname)
       | None -> None
 
 let rec infer env e : texpr =
@@ -106,7 +124,10 @@ let rec infer env e : texpr =
       (match resolve_var env id with
        | Some (v, t) -> mk (TVar v) t
        | None ->
-         let ty = if scoped_mem env.schemas env id then TSchema id else TTag id in
+         let ty = match scoped_find_canon env.schemas env id with
+           | Some (canon, _) -> TSchema canon
+           | None            -> TTag id
+         in
          mk (TVar (VarTag id)) ty)
   | EField (obj, fpos, f) ->
       let to_ = infer env obj in
@@ -342,7 +363,13 @@ let typecheck_schema schemas actions sch =
            | Some te -> TFDerived (n, te)
            | None    -> TFRaw (n, TAny))) sch.sfields
   in
-  let tsch = { ts_name = sch.sname; ts_fields = tfields; ts_types = all_types } in
+  let tsch = {
+    ts_name   = qualify sch.sdomain sch.sname;
+    ts_bare   = sch.sname;
+    ts_domain = sch.sdomain;
+    ts_fields = tfields;
+    ts_types  = all_types;
+  } in
   (tsch, List.rev !errors)
 
 (* ---------- rules ---------- *)
@@ -358,11 +385,21 @@ let pick_schema_for_rule env r =
       | EIsMissing _ | EIsPresent _ | ECall _ | EField _ -> ()) e in
   List.iter collect r.rwhen;
   List.iter collect r.rthen;
+  (* Restrict candidates to the rule's domain (or top-level when the
+     rule has no domain) so two same-bare-name schemas in different
+     domains can't masquerade as each other's home schema. *)
+  let in_scope (ts : tschema) =
+    match env.current_domain with
+    | None        -> ts.ts_domain = None
+    | Some d      -> ts.ts_domain = Some d || ts.ts_domain = None
+  in
   let scored = Hashtbl.fold (fun name ts acc ->
-    let names = List.map fst ts.ts_types in
-    let overlap = List.fold_left (fun n id ->
-      if List.mem id names then n + 1 else n) 0 !referenced in
-    (name, overlap) :: acc) env.schemas [] in
+    if not (in_scope ts) then acc
+    else
+      let names = List.map fst ts.ts_types in
+      let overlap = List.fold_left (fun n id ->
+        if List.mem id names then n + 1 else n) 0 !referenced in
+      (name, overlap) :: acc) env.schemas [] in
   match List.sort (fun (_, a) (_, b) -> compare b a) scored with
   | (s, n) :: _ when n > 0 -> s
   | _ -> err "rule %s: no schema overlaps any referenced name"
@@ -381,12 +418,12 @@ let typecheck_call env (e : expr) : tcall =
   match e.e_node with
   | ECall (name, args) ->
       let targs = List.map (infer env) args in
-      (match scoped_find env.actions env name with
+      (match scoped_find_canon env.actions env name with
        | None ->
            if env.strict_calls then
              err "action `%s` has no @action declaration (strict mode)" name;
            (e.e_pos, name, targs)
-       | Some sig_params ->
+       | Some (canon, sig_params) ->
            if List.length sig_params <> List.length targs then
              err "action %s expects %d argument(s), got %d"
                name (List.length sig_params) (List.length targs);
@@ -396,7 +433,7 @@ let typecheck_call env (e : expr) : tcall =
                with Type_error m ->
                  err "argument `%s`: %s" sp.pty_name m
              in ()) sig_params targs;
-           (e.e_pos, name, targs))
+           (e.e_pos, canon, targs))
   | EVar _ | EField _ | ELit _ | EList _ | EObject _ | EWildcard | EMissing
   | EUnary _ | EBin _ | EIf _ | EAny _ | EEvery _ | ECount _ | ESum _
   | EIsMissing _ | EIsPresent _ -> err "expected a call expression"
@@ -404,15 +441,19 @@ let typecheck_call env (e : expr) : tcall =
 let typecheck_rule env r =
   let env = { env with current_domain = r.rdomain } in
   let where = String.concat "." r.rpath in
-  let sname = match r.rschema with
+  let sname, ts = match r.rschema with
     | Some s ->
-        if not (scoped_mem env.schemas env s) then
-          err_at r.rpos "rule %s on %s: unknown schema" where s;
-        s
-    | None -> pick_schema_for_rule env r in
-  let ts = match scoped_find env.schemas env sname with
-    | Some t -> t
-    | None -> err_at r.rpos "rule %s: schema %s not found" where sname in
+        (match scoped_find_canon env.schemas env s with
+         | Some r -> r
+         | None ->
+             err_at r.rpos "rule %s on %s: unknown schema" where s)
+    | None ->
+        let canon = pick_schema_for_rule env r in
+        (match Hashtbl.find_opt env.schemas canon with
+         | Some t -> canon, t
+         | None ->
+             err_at r.rpos "rule %s: schema %s not found" where canon)
+  in
   let env' = { env with fields = ts.ts_types } in
   let twhen = List.map (fun (pos, p) ->
     if has_wildcard p then
@@ -430,15 +471,18 @@ let typecheck_rule env r =
 
 let typecheck_test env t =
   let env = { env with current_domain = t.tdomain } in
-  let sname = t.tgiven.gschema in
-  let ts = match scoped_find env.schemas env sname with
-    | Some s -> s
-    | None   -> err_at t.tpos "test %S: unknown schema %s" t.tname sname in
+  let bare_sname = t.tgiven.gschema in
+  let canon_sname, ts =
+    match scoped_find_canon env.schemas env bare_sname with
+    | Some r -> r
+    | None ->
+        err_at t.tpos "test %S: unknown schema %s" t.tname bare_sname
+  in
   let env_g = { env with fields = ts.ts_types } in
   let givens = List.map (fun a ->
     match List.assoc_opt a.aname ts.ts_types with
     | None -> err_at a.apos "test %S: no field `%s` in schema %s"
-                t.tname a.aname sname
+                t.tname a.aname bare_sname
     | Some expected ->
         let te =
           try check env_g a.avalue expected
@@ -455,15 +499,19 @@ let typecheck_test env t =
       with Type_error m -> err_at pos "test %S expect: %s" t.tname m
     in ctor call) t.texpect
   in
-  { tt_name = t.tname;
-    tt_given = { tg_schema = sname; tg_values = givens };
+  { tt_name = qualify t.tdomain t.tname;
+    tt_bare = t.tname;
+    tt_given = { tg_schema = canon_sname; tg_values = givens };
     tt_expect = expects }
 
 let typecheck_instance env i =
   let env = { env with current_domain = i.idomain } in
-  let ts = match scoped_find env.schemas env i.ischema with
-    | Some s -> s
-    | None   -> err_at i.ipos "instance %s: unknown schema %s" i.iname i.ischema in
+  let canon_schema, ts =
+    match scoped_find_canon env.schemas env i.ischema with
+    | Some r -> r
+    | None   ->
+        err_at i.ipos "instance %s: unknown schema %s" i.iname i.ischema
+  in
   let env_g = { env with fields = ts.ts_types } in
   let values = List.map (fun a ->
     match List.assoc_opt a.aname ts.ts_types with
@@ -475,12 +523,15 @@ let typecheck_instance env i =
           with Type_error m ->
             err_at a.apos "instance %s: %s = ...: %s" i.iname a.aname m
         in (a.aname, te)) i.ivalues in
-  { ti_name = i.iname; ti_schema = i.ischema; ti_values = values }
+  { ti_name   = qualify i.idomain i.iname;
+    ti_bare   = i.iname;
+    ti_schema = canon_schema;
+    ti_values = values }
 
 let typecheck_action schemas a =
   let params = List.map (fun p ->
     let ty =
-      try resolve_ty_annot schemas p.ptype
+      try resolve_ty_annot ?domain:a.asdomain schemas p.ptype
       with Type_error m ->
         err_at p.ppos "@action %s param `%s`: %s" a.asname p.pname m
     in { pty_name = p.pname; pty = ty }) a.asparams in
@@ -549,6 +600,7 @@ let run program =
         else begin
           Hashtbl.add actions key params;
           action_decls := { ta_name = key;
+                            ta_bare = n;
                             ta_params = List.map (fun p -> (p.pty_name, p.pty)) params;
                             ta_pos = a.aspos } :: !action_decls
         end) (Ast.actions program);

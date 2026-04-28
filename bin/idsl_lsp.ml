@@ -16,40 +16,115 @@ let ws : Workspace.t = Workspace.create ()
    has a transient parse error. *)
 let last_good : (string, Ast.program * Typed.tprogram) Hashtbl.t = Hashtbl.create 4
 
+let () =
+  Workspace.on_remove ws (fun ~uri -> Hashtbl.remove last_good uri)
+
+(* Server lifecycle. After `shutdown` only `exit` is legal (LSP spec):
+   subsequent requests get InvalidRequest. `watcher_status` lets
+   workspace queries detect that the client rejected/ignored our
+   dynamic registration and fall back to per-request rescans. *)
+let shutdown_requested = ref false
+
+type watcher_status = Pending | Active | Failed of string
+let watcher_status : watcher_status ref = ref Pending
+
+(* When watchers aren't confirmed, fall back to periodic rescans
+   instead of one-readdir-per-keystroke: workspace/symbol fires on
+   every character in the picker, and a permanent `Failed` state would
+   otherwise re-walk every folder on every keystroke. *)
+let fallback_rescan_interval_s = 5.0
+let next_fallback_rescan = ref 0.0
+
+let ensure_workspace_freshness () =
+  match !watcher_status with
+  | Active -> ()
+  | Pending | Failed _ ->
+      let now = Unix.gettimeofday () in
+      if now >= !next_fallback_rescan then begin
+        (* Both halves matter: rescan picks up new/deleted files,
+           drop_closed_doc_cache forces re-compile of closed files
+           whose content may have changed. Without the second half,
+           workspace/symbol would happily keep returning ASTs from a
+           Session.t that's been valid since startup. *)
+        Workspace.invalidate_folder_scan ws;
+        Workspace.drop_closed_doc_cache ws;
+        next_fallback_rescan := now +. fallback_rescan_interval_s
+      end
+
+let watcher_registration_id = "watcher-registration"
+
 (* ---------- JSON-RPC framing ---------- *)
 
 let log fmt = Printf.eprintf ("[idsl-lsp] " ^^ fmt ^^ "\n%!")
 
-let read_message ic : Json.t option =
+(* Frames distinguish "client closed the pipe" (Eof → end loop) from
+   "garbled message" (Bad_frame → log and skip). *)
+type frame =
+  | Frame     of Json.t
+  | Bad_frame of string
+  | Eof
+
+(* Protective cap on Content-Length to bound Bytes.create allocations.
+   The LSP protocol has no cap; 64 MiB sits well above observed
+   workspace-symbol payloads. *)
+let max_frame_bytes = 64 * 1024 * 1024
+
+let read_message ic : frame =
   let read_headers () =
+    (* Headers loop returns either Some len, None (saw EOF before any
+       content), or `Bad of msg` when a header was syntactically bad
+       enough that we can't safely parse the body. *)
     let len = ref None in
+    let bad : string option ref = ref None in
     let rec loop () =
-      let line = input_line ic in
-      let line = String.trim line in
-      if line = "" then ()
-      else begin
-        (try
-          let prefix = "Content-Length:" in
-          let plen = String.length prefix in
-          if String.length line > plen
-             && String.sub line 0 plen = prefix then
-            len := Some (int_of_string (String.trim
-              (String.sub line plen (String.length line - plen))))
-         with _ -> ());
-        loop ()
-      end
+      match input_line ic with
+      | exception End_of_file -> ()
+      | line ->
+          let line = String.trim line in
+          if line = "" then ()
+          else begin
+            let prefix = "Content-Length:" in
+            let plen = String.length prefix in
+            if String.length line > plen
+               && String.sub line 0 plen = prefix then begin
+              let value = String.trim
+                (String.sub line plen (String.length line - plen)) in
+              (match int_of_string_opt value with
+               | Some n when n >= 0 && n <= max_frame_bytes -> len := Some n
+               | Some n when n < 0 ->
+                   bad := Some (Printf.sprintf
+                     "negative Content-Length %d" n)
+               | Some n ->
+                   bad := Some (Printf.sprintf
+                     "Content-Length %d exceeds cap %d" n max_frame_bytes)
+               | None ->
+                   bad := Some (Printf.sprintf
+                     "non-integer Content-Length %S" value))
+            end;
+            loop ()
+          end
     in
-    (try loop () with End_of_file -> ());
-    !len
+    loop ();
+    match !bad with
+    | Some msg -> `Bad msg
+    | None -> (match !len with Some n -> `Len n | None -> `Eof)
   in
   match read_headers () with
-  | None -> None
-  | Some n ->
+  | `Eof -> Eof
+  | `Bad msg ->
+      log "frame error: %s" msg;
+      Bad_frame msg
+  | `Len n ->
       let buf = Bytes.create n in
-      really_input ic buf 0 n;
-      try Some (Json.of_string (Bytes.unsafe_to_string buf))
-      with Json.Parse_error msg ->
-        log "JSON parse error: %s" msg; None
+      (match really_input ic buf 0 n with
+       | exception End_of_file ->
+           Bad_frame (Printf.sprintf
+             "truncated body: expected %d bytes, got fewer" n)
+       | () ->
+           (try Frame (Json.of_string (Bytes.unsafe_to_string buf))
+            with Json.Parse_error msg ->
+              log "JSON parse error: %s" msg;
+              Bad_frame ("invalid JSON: " ^ msg)))
 
 let write_message oc (j : Json.t) =
   let body = Json.to_string j in
@@ -66,6 +141,21 @@ let notif method_ params : Json.t =
   JObj [ "jsonrpc", JStr "2.0"; "method", JStr method_; "params", params ]
 
 let ok_response id = result id JNull
+
+(* JSON-RPC 2.0 reserved error codes. *)
+let err_invalid_request   = -32600
+let err_method_not_found  = -32601
+let err_internal_error    = -32603
+
+let error_response id ~code msg : Json.t =
+  JObj [
+    "jsonrpc", JStr "2.0";
+    "id",      id;
+    "error",   JObj [
+      "code",    JNum (float_of_int code);
+      "message", JStr msg;
+    ];
+  ]
 
 (* ---------- LSP value helpers ---------- *)
 
@@ -360,19 +450,25 @@ let handle_did_change oc params =
           ~el:end_p.line ~ec:end_p.character
           new_text
   ) current changes in
-  if updated <> "" then begin
-    let version = match json_field params "textDocument" with
-      | Some td -> (match json_field td "version" with
-                    | Some n -> json_num n | None -> 0)
-      | None -> 0 in
-    Workspace.put_doc ws ~uri ~content:updated ~version;
-    let affected = Workspace.invalidate ws ~uri in
-    analyze_and_publish oc uri;
-    (* Re-publish diagnostics for every doc whose cache we just dropped
-       — they may now show new errors (or have errors cleared). *)
-    List.iter (fun u ->
-      if u <> uri then analyze_and_publish oc u) affected
-  end
+  let version = match json_field params "textDocument" with
+    | Some td -> (match json_field td "version" with
+                  | Some n -> json_num n | None -> 0)
+    | None -> 0 in
+  (* Always apply — emptying the buffer is a legitimate edit.  Reject
+     only when the incoming version is strictly older than what we
+     already hold (out-of-order delivery via a bridge / proxy / retry
+     would otherwise roll the buffer back to a stale snapshot). *)
+  match Workspace.put_doc_versioned ws ~uri ~content:updated ~version with
+  | `Stale current_v ->
+      log "didChange: dropping stale v%d for %s (current v%d)"
+        version uri current_v
+  | `Updated ->
+      let affected = Workspace.invalidate ws ~uri in
+      analyze_and_publish oc uri;
+      (* Re-publish diagnostics for every doc whose cache we just dropped
+         — they may now show new errors (or have errors cleared). *)
+      List.iter (fun u ->
+        if u <> uri then analyze_and_publish oc u) affected
 
 let kind_of_comp = function
   | Lsp_query.CompField    -> 5    (* Field *)
@@ -627,6 +723,7 @@ let symbol_info_to_json ~fallback_uri (s : Symbol.t) : Json.t =
   ]
 
 let handle_workspace_symbol id params =
+  ensure_workspace_freshness ();
   let q = match json_field params "query" with
     | Some (JStr s) -> s | _ -> "" in
   (* `compile_all_known` covers open + on-disk files; sessions that
@@ -1297,6 +1394,7 @@ let handle_pull_diagnostics id params =
    doc and patch its `include "..."` strings. *)
 
 let handle_will_rename_files id params =
+  ensure_workspace_freshness ();
   let files = match json_field params "files" with
     | Some (JArr xs) -> xs | _ -> [] in
   (* Scan every known *.idsl (open + on-disk) so file rename also
@@ -1338,20 +1436,22 @@ let handle_did_change_watched_files oc params =
   (* Any create / delete shifts the set of files under workspace
      folders; invalidate the scan cache so the next workspace/symbol
      query sees the new state. *)
-  Workspace.invalidate_folder_scan ws;
+  let change_of_int = function
+    | 1 -> Some Workspace.Created
+    | 2 -> Some Workspace.Changed
+    | 3 -> Some Workspace.Deleted
+    | _ -> None in
   List.iter (fun c ->
     let uri = match json_field c "uri" with
       | Some j -> json_str j | _ -> "" in
     let typ = match json_field c "type" with
       | Some n -> json_num n | None -> 0 in
-    (* type: 1=Created, 2=Changed, 3=Deleted *)
-    if typ = 3 then Workspace.remove_doc ws ~uri
-    else begin
-      let affected = Workspace.invalidate ws ~uri in
-      List.iter (fun u ->
-        if Workspace.get_doc ws ~uri:u <> None then
-          analyze_and_publish oc u) affected
-    end) changes
+    match change_of_int typ with
+    | None -> log "didChangeWatchedFiles: unknown type %d for %s" typ uri
+    | Some change ->
+        let to_publish =
+          Workspace.handle_watched_change ws ~uri ~change in
+        List.iter (analyze_and_publish oc) to_publish) changes
 
 let handle_did_change_configuration _oc params =
   match json_field params "settings" with
@@ -1438,21 +1538,26 @@ let handle_execute_command id params =
 
 (* ---------- main loop ---------- *)
 
-let () =
-  let ic = stdin and oc = stdout in
-  set_binary_mode_in ic true;
-  set_binary_mode_out oc true;
-  let running = ref true in
-  while !running do
-    match read_message ic with
-    | None -> running := false
-    | Some msg ->
-        let method_ = match json_field msg "method" with
-          | Some (JStr s) -> s | _ -> "" in
-        let id = match json_field msg "id" with Some j -> j | _ -> JNull in
-        let params = match json_field msg "params" with
-          | Some j -> j | _ -> JNull in
-        (match method_ with
+(* Heuristic: requests have an `id`, notifications don't. Used by the
+   error-response paths so we don't reply to a notification (which
+   would itself violate the JSON-RPC contract). *)
+let has_id msg =
+  match json_field msg "id" with
+  | None | Some JNull -> false
+  | Some _            -> true
+
+(* Dispatch one already-parsed JSON-RPC message. Wrapped in `dispatch`
+   below so a handler-level exception turns into a JSON-RPC error
+   response (or, for notifications, a logged warning) — never a server
+   crash. The few handlers that mutate workspace state still see their
+   exception, but the *main loop* keeps reading. *)
+let dispatch_message oc msg =
+  let method_ = match json_field msg "method" with
+    | Some (JStr s) -> s | _ -> "" in
+  let id = match json_field msg "id" with Some j -> j | _ -> JNull in
+  let params = match json_field msg "params" with
+    | Some j -> j | _ -> JNull in
+  (match method_ with
          | "initialize"  -> write_message oc (handle_initialize id params)
          | "initialized" ->
              (* Server → client: dynamically register interest in
@@ -1460,10 +1565,11 @@ let () =
                 workspace cache only learns about disk changes when
                 the editor *happens* to be configured to forward them
                 — which most clients don't do without an explicit
-                registration request. *)
+                registration request. The response is correlated by
+                `watcher_registration_id` (see `handle_response`). *)
              let req = Json.JObj [
                "jsonrpc", Json.JStr "2.0";
-               "id",      Json.JStr "watcher-registration";
+               "id",      Json.JStr watcher_registration_id;
                "method",  Json.JStr "client/registerCapability";
                "params",  Json.JObj [
                  "registrations", Json.JArr [
@@ -1558,7 +1664,101 @@ let () =
              write_message oc (handle_pull_diagnostics id params)
          | "workspace/willRenameFiles" ->
              write_message oc (handle_will_rename_files id params)
-         | "shutdown" -> write_message oc (ok_response id)
-         | "exit"     -> running := false
-         | other -> log "ignoring %s" other)
+         | "shutdown" ->
+             shutdown_requested := true;
+             write_message oc (ok_response id)
+         | "exit"     -> raise Exit
+         | other ->
+             (* Notifications can be ignored; requests must get a
+                Method-not-found error so the client doesn't hang
+                waiting for a reply that's never coming. *)
+             if has_id msg then begin
+               log "method not found: %s" other;
+               write_message oc
+                 (error_response id ~code:err_method_not_found
+                    ("method not found: " ^ other))
+             end else
+               log "ignoring notification %s" other)
+
+(* Detect a JSON-RPC *response* coming back from the client (no method,
+   has id, has result/error). Returns the id as a string for routing. *)
+let response_kind msg =
+  if json_field msg "method" <> None then None
+  else
+    match json_field msg "id" with
+    | Some (JStr id_s) ->
+        let result_present = json_field msg "result" <> None in
+        let error_present  = json_field msg "error"  <> None in
+        if result_present then Some (`Result id_s)
+        else if error_present then
+          let err_msg = match json_field msg "error" with
+            | Some j ->
+                (match json_field j "message" with
+                 | Some (JStr s) -> s
+                 | _ -> "client error")
+            | None -> "client error"
+          in Some (`Error (id_s, err_msg))
+        else None
+    | _ -> None
+
+let handle_response = function
+  | `Result id_s when id_s = watcher_registration_id ->
+      watcher_status := Active;
+      log "file watcher registration acknowledged"
+  | `Error (id_s, err) when id_s = watcher_registration_id ->
+      watcher_status := Failed err;
+      log "file watcher registration rejected: %s — \
+           workspace queries will fall back to per-request rescans" err
+  | `Result id_s ->
+      log "ignoring response for unknown request id %s" id_s
+  | `Error (id_s, err) ->
+      log "ignoring error response for unknown request id %s: %s" id_s err
+
+let dispatch oc msg =
+  match response_kind msg with
+  | Some r -> handle_response r
+  | None ->
+    (* Per LSP: after `shutdown` the only legal incoming message is the
+       `exit` notification. Reject every request with InvalidRequest;
+       drop other notifications quietly so the loop stays out of state-
+       mutation paths until the client follows through with `exit`. *)
+    let method_ = match json_field msg "method" with
+      | Some (JStr s) -> s | _ -> "" in
+    if !shutdown_requested && method_ <> "exit" then begin
+      if has_id msg then
+        let id = match json_field msg "id" with Some j -> j | _ -> JNull in
+        write_message oc
+          (error_response id ~code:err_invalid_request
+             ("invalid request after shutdown: " ^ method_))
+      else
+        log "ignoring %s after shutdown" method_
+    end else
+      try dispatch_message oc msg
+      with
+      | Exit -> raise Exit
+      | exn ->
+          let msg_str = Printexc.to_string exn in
+          let bt = Printexc.get_backtrace () in
+          log "request handler exception: %s\n%s" msg_str bt;
+          if has_id msg then
+            let id = match json_field msg "id" with Some j -> j | _ -> JNull in
+            write_message oc
+              (error_response id ~code:err_internal_error
+                 ("internal error: " ^ msg_str))
+
+let () =
+  Printexc.record_backtrace true;
+  let ic = stdin and oc = stdout in
+  set_binary_mode_in ic true;
+  set_binary_mode_out oc true;
+  let running = ref true in
+  while !running do
+    match read_message ic with
+    | Eof -> running := false
+    | Bad_frame _ ->
+        (* Skip the malformed frame and keep reading. The next valid
+           Content-Length / body pair will resync the stream. *)
+        ()
+    | Frame msg ->
+        (try dispatch oc msg with Exit -> running := false)
   done

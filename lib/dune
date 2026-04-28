@@ -6,7 +6,7 @@
 
 (library
  (name iDSL)
- (libraries str))
+ (libraries str unix))
 
 (ocamllex lexer)
 
