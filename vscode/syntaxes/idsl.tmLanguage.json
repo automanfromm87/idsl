@@ -41,11 +41,11 @@
       "name": "entity.name.tag.idsl"
     },
     "keywords":  {
-      "match": "\\b(schema|rule|test|instance|action|include|when|then|given|expect|on|priority|if|then|else|and|or|not|any|every|count|sum|of|in|where|is|missing|present|true|false|min|max|for|e\\.g\\.|i\\.e\\.)\\b",
+      "match": "\\b(schema|rule|test|instance|action|include|domain|predicate|when|then|given|expect|cases|on|priority|if|then|else|and|or|not|any|every|count|sum|of|in|where|is|missing|present|true|false|min|max|for|self|default)\\b",
       "name": "keyword.control.idsl"
     },
     "operators": {
-      "match": "==|!=|<=|>=|<|>|\\+|-|\\*|/|=",
+      "match": "->|==|!=|<=|>=|<|>|\\+|-|\\*|/|=",
       "name": "keyword.operator.idsl"
     },
     "identifier": {
