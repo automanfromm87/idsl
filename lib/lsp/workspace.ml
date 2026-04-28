@@ -55,9 +55,6 @@ let on_remove ws (cb : uri:string -> unit) =
    the hot path on every `workspace/symbol` keystroke at O(1). *)
 let invalidate_folder_scan ws = ws.folder_scan_cache <- None
 
-let set_folders ws (urls : string list) =
-  ws.folders <- urls;
-  invalidate_folder_scan ws
 let folders ws = ws.folders
 
 let set_config ws ~key ~value = Hashtbl.replace ws.config key value
@@ -159,6 +156,21 @@ let canon_uri (uri : string) : string =
      && String.sub uri 0 scheme_len = scheme
   then uri_of_path (Driver.canon (path_of_uri uri))
   else uri
+
+(* Folders go through canon_uri + dedupe so two equivalent forms
+   (`file:///proj`, `file://localhost/proj`, with/without trailing
+   slash) collapse to one root. Without this the scan double-walks
+   and didChangeWorkspaceFolders.add/remove can't reliably match. *)
+let dedup_canon (urls : string list) : string list =
+  let seen = Hashtbl.create 8 in
+  List.filter_map (fun u ->
+    let c = canon_uri u in
+    if Hashtbl.mem seen c then None
+    else begin Hashtbl.add seen c (); Some c end) urls
+
+let set_folders ws (urls : string list) =
+  ws.folders <- dedup_canon urls;
+  invalidate_folder_scan ws
 
 (* Map a `Lexing.position.pos_fname` into a `file://` URI, falling back
    to a caller-supplied URI when the position has no filename — most

@@ -13,11 +13,20 @@ let ws : Workspace.t = Workspace.create ()
 
 (* Most-recent successful compile per doc. Kept separately from the
    Workspace cache so that completion/hover stay live while the user
-   has a transient parse error. *)
-let last_good : (string, Ast.program * Typed.tprogram) Hashtbl.t = Hashtbl.create 4
+   has a transient parse error. Wrapped behind a tiny accessor so every
+   put/get/remove canonicalizes its URI — `Workspace.on_remove` already
+   delivers the canonical form, but raw URIs flowing in from JSON-RPC
+   params would otherwise key parallel entries that the cleanup hook
+   can't reach. *)
+module Last_good = struct
+  let tbl : (string, Ast.program * Typed.tprogram) Hashtbl.t =
+    Hashtbl.create 4
+  let put ~uri pair  = Hashtbl.replace tbl (Workspace.canon_uri uri) pair
+  let get ~uri       = Hashtbl.find_opt tbl (Workspace.canon_uri uri)
+end
 
 let () =
-  Workspace.on_remove ws (fun ~uri -> Hashtbl.remove last_good uri)
+  Workspace.on_remove ws (fun ~uri -> Hashtbl.remove Last_good.tbl uri)
 
 (* Server lifecycle. After `shutdown` only `exit` is legal (LSP spec):
    subsequent requests get InvalidRequest. `watcher_status` lets
@@ -189,15 +198,11 @@ let utf16_range ~src (s : Lsp_query.lsp_pos) (e : Lsp_query.lsp_pos) : Json.t =
   JObj [ "start", utf16_pos_to_json ~src s;
          "end",   utf16_pos_to_json ~src e ]
 
-(* Backwards-compat shims: byte-column wire writers used by the few
-   handlers that have no convenient way to grab a per-URI source.
-   These are only correct for ASCII-only docs and should be removed
-   once every call site routes through `utf16_pos_to_json`. *)
-let lsp_pos_json (p : Lsp_query.lsp_pos) : Json.t =
-  utf16_pos_to_json ~src:"" p
-
-let range_json (s : Lsp_query.lsp_pos) (e : Lsp_query.lsp_pos) : Json.t =
-  utf16_range ~src:"" s e
+(* sym_range_to_json takes the host source explicitly so the column
+   conversion is always UTF-16-correct, even on non-ASCII lines. The
+   ASCII-only byte-column shims that used to sit here are gone. *)
+let sym_range_to_json ~src (r : Lsp_query.sym_range) : Json.t =
+  utf16_range ~src r.sr_start r.sr_end
 
 let diagnostic_json ~src (d : Lsp_query.diagnostic) : Json.t =
   JObj [
@@ -229,7 +234,7 @@ let get_src uri =
 let analyze_and_publish oc uri =
   let s = Workspace.compile_doc ws ~uri in
   (match s.ast, s.typed with
-   | Some p, Some tp -> Hashtbl.replace last_good uri (p, tp)
+   | Some p, Some tp -> Last_good.put ~uri (p, tp)
    | _ -> ());
   let diags = List.map Lsp_query.lsp_of_diag s.diagnostics in
   publish_diagnostics oc uri diags
@@ -241,7 +246,7 @@ let best_effort_progs uri _src =
   let s = Workspace.compile_doc ws ~uri in
   match s.ast, s.typed with
   | Some p, Some tp -> Some (p, tp), s.cst_tokens
-  | _               -> Hashtbl.find_opt last_good uri, s.cst_tokens
+  | _               -> Last_good.get ~uri, s.cst_tokens
 
 let json_field obj k =
   match obj with
@@ -657,18 +662,13 @@ let handle_hover id params =
 
 (* ---------- Round-1 navigation handlers ---------- *)
 
-let lsp_pos_to_json = lsp_pos_json
-
-let sym_range_to_json (r : Lsp_query.sym_range) : Json.t =
-  range_json r.sr_start r.sr_end
-
-let rec doc_symbol_to_json (s : Lsp_query.doc_symbol) : Json.t =
+let rec doc_symbol_to_json ~src (s : Lsp_query.doc_symbol) : Json.t =
   let base = [
     "name",           Json.JStr s.ds_name;
     "kind",           JNum (float_of_int s.ds_kind);
-    "range",          sym_range_to_json s.ds_range;
-    "selectionRange", sym_range_to_json s.ds_selection;
-    "children",       JArr (List.map doc_symbol_to_json s.ds_children);
+    "range",          sym_range_to_json ~src s.ds_range;
+    "selectionRange", sym_range_to_json ~src s.ds_selection;
+    "children",       JArr (List.map (doc_symbol_to_json ~src) s.ds_children);
   ] in
   let with_detail = match s.ds_detail with
     | Some d -> base @ [ "detail", JStr d ]
@@ -682,21 +682,22 @@ let handle_document_symbol id params =
     | _ -> "" in
   match get_src uri with
   | None -> result id (JArr [])
-  | Some _ ->
+  | Some src ->
     let in_file = Workspace.path_of_uri uri in
     let s = Workspace.compile_doc ws ~uri in
+    let to_json = doc_symbol_to_json ~src in
     match Session.index s with
     | Some idx ->
         let syms = Lsp_query.document_symbols ~in_file idx s.cst in
-        result id (JArr (List.map doc_symbol_to_json syms))
+        result id (JArr (List.map to_json syms))
     | None ->
         (* Fall back to the last good compile when the current doc has
            parse / typecheck errors — keeps the outline visible. *)
-        match Hashtbl.find_opt last_good uri with
+        match Last_good.get ~uri with
         | Some (prog, tp) ->
             let idx = Semantic_index.build prog tp s.cst in
             let syms = Lsp_query.document_symbols ~in_file idx s.cst in
-            result id (JArr (List.map doc_symbol_to_json syms))
+            result id (JArr (List.map to_json syms))
         | None -> result id (JArr [])
 
 (* SymbolInformation: the URI must be the symbol's *own* declaration
@@ -710,15 +711,16 @@ let symbol_info_to_json ~fallback_uri (s : Symbol.t) : Json.t =
   let end_p = { lp with character = lp.character + len } in
   let uri =
     Workspace.uri_of_pos_fname ~fallback:fallback_uri s.decl_pos.pos_fname in
+  (* UTF-16 column relative to the *host* file's source — the symbol
+     might be declared in a different doc than the one whose handler
+     produced this entry. *)
+  let host_src = source_for_uri uri in
   JObj [
     "name", JStr s.label;
     "kind", JNum (float_of_int kind);
     "location", JObj [
       "uri",   JStr uri;
-      "range", JObj [
-        "start", lsp_pos_to_json lp;
-        "end",   lsp_pos_to_json end_p;
-      ]
+      "range", utf16_range ~src:host_src lp end_p;
     ]
   ]
 
@@ -796,20 +798,17 @@ let handle_selection_range id params =
     | _ -> [] in
   match get_src uri with
   | None -> result id (JArr [])
-  | Some _ ->
+  | Some src ->
     let s = Workspace.compile_doc ws ~uri in
-    (* For each requested cursor, fold the chain of CST ranges (root-most
-       first) into a linked Selection structure (innermost first, parent
-       link to outer). *)
     let chain_of pos =
       let chain = Lsp_query.selection_ranges_at s.cst pos in
-      let chain = List.rev chain in   (* innermost first *)
+      let chain = List.rev chain in
       let rec build = function
         | [] -> Json.JNull
         | r :: rest ->
             let parent = build rest in
             JObj [
-              "range",  sym_range_to_json r;
+              "range",  sym_range_to_json ~src r;
               "parent", parent;
             ]
       in
@@ -881,7 +880,7 @@ let handle_inlay_hint id params =
         let hints = Lsp_query.inlay_hints_in_range tp ~start_line ~end_line in
         let arr = List.map (fun (h : Lsp_query.inlay_hint) ->
           Json.JObj [
-            "position",     lsp_pos_to_json h.ih_pos;
+            "position",     utf16_pos_to_json ~src h.ih_pos;
             "label",        JStr h.ih_label;
             "kind",         JNum (float_of_int h.ih_kind);
             "paddingRight", JBool h.ih_pad_r;
@@ -902,13 +901,13 @@ let handle_code_lens id params =
         let arr = List.map (fun (l : Lsp_query.code_lens) ->
           let lp = Lsp_query.pos_lsp_of_lex l.cl_target in
           Json.JObj [
-            "range",   sym_range_to_json l.cl_range;
+            "range",   sym_range_to_json ~src l.cl_range;
             "command", JObj [
               "title",     JStr l.cl_label;
               "command",   JStr "editor.action.showReferences";
               "arguments", JArr [
                 JStr uri;
-                lsp_pos_to_json lp;
+                utf16_pos_to_json ~src lp;
                 JArr [];
               ];
             ];
@@ -978,7 +977,7 @@ let handle_prepare_rename id params =
           (* LSP allows three return shapes; we use the {range,placeholder}
              form so the inline rename box is pre-populated. *)
           result id (JObj [
-            "range",       sym_range_to_json rt.rt_range;
+            "range",       sym_range_to_json ~src rt.rt_range;
             "placeholder", JStr rt.rt_label;
           ])
 
@@ -1132,7 +1131,7 @@ let handle_range_formatting id params =
       let formatted, range =
         Lsp_query.format_range src ~start_line:s_ln ~end_line:e_ln in
       let edit = Json.JObj [
-        "range",   sym_range_to_json range;
+        "range",   sym_range_to_json ~src range;
         "newText", JStr formatted;
       ] in
       result id (JArr [edit])
@@ -1220,12 +1219,13 @@ let handle_implementation = handle_declaration
 
 let call_item_to_json ~fallback_uri (it : Lsp_query.call_item) : Json.t =
   let uri = Workspace.uri_of_pos_fname ~fallback:fallback_uri it.ci_pos_fname in
+  let host_src = source_for_uri uri in
   Json.JObj [
     "name",           Json.JStr it.ci_name;
     "kind",           Json.JNum (float_of_int it.ci_kind_int);
     "uri",            Json.JStr uri;
-    "range",          sym_range_to_json it.ci_range;
-    "selectionRange", sym_range_to_json it.ci_selection;
+    "range",          sym_range_to_json ~src:host_src it.ci_range;
+    "selectionRange", sym_range_to_json ~src:host_src it.ci_selection;
     "data",           Json.JStr it.ci_data_id;
   ]
 
@@ -1288,10 +1288,15 @@ let handle_call_hierarchy_incoming id params =
         | None -> result id (JArr [])
         | Some idx ->
           let items = Lsp_query.incoming_calls idx tp it in
-          result id (JArr (List.map (fun caller ->
+          result id (JArr (List.map (fun (caller : Lsp_query.call_item) ->
+            let caller_uri = Workspace.uri_of_pos_fname
+              ~fallback:uri caller.ci_pos_fname in
+            let caller_src = source_for_uri caller_uri in
             Json.JObj [
               "from",       call_item_to_json ~fallback_uri:uri caller;
-              "fromRanges", Json.JArr [sym_range_to_json caller.ci_range];
+              "fromRanges", Json.JArr
+                              [sym_range_to_json ~src:caller_src
+                                 caller.ci_range];
             ]) items))
 
 let handle_call_hierarchy_outgoing id params =
@@ -1308,10 +1313,15 @@ let handle_call_hierarchy_outgoing id params =
         | None -> result id (JArr [])
         | Some idx ->
           let items = Lsp_query.outgoing_calls idx tp it in
-          result id (JArr (List.map (fun callee ->
+          result id (JArr (List.map (fun (callee : Lsp_query.call_item) ->
+            let callee_uri = Workspace.uri_of_pos_fname
+              ~fallback:uri callee.ci_pos_fname in
+            let callee_src = source_for_uri callee_uri in
             Json.JObj [
               "to",         call_item_to_json ~fallback_uri:uri callee;
-              "fromRanges", Json.JArr [sym_range_to_json callee.ci_range];
+              "fromRanges", Json.JArr
+                              [sym_range_to_json ~src:callee_src
+                                 callee.ci_range];
             ]) items))
 
 let handle_prepare_type_hierarchy id params =
@@ -1473,16 +1483,17 @@ let handle_did_change_configuration _oc params =
 let handle_did_change_workspace_folders _oc params =
   match json_field params "event" with
   | Some ev ->
-      let added = match json_field ev "added" with
-        | Some (JArr xs) -> List.filter_map (fun f ->
-            match json_field f "uri" with
-            | Some j -> Some (json_str j) | _ -> None) xs
-        | _ -> [] in
-      let removed = match json_field ev "removed" with
-        | Some (JArr xs) -> List.filter_map (fun f ->
-            match json_field f "uri" with
-            | Some j -> Some (json_str j) | _ -> None) xs
-        | _ -> [] in
+      let extract field =
+        match json_field ev field with
+        | Some (JArr xs) ->
+            List.filter_map (fun f ->
+              match json_field f "uri" with
+              | Some j -> Some (Workspace.canon_uri (json_str j))
+              | _ -> None) xs
+        | _ -> []
+      in
+      let added   = extract "added" in
+      let removed = extract "removed" in
       let cur = Workspace.folders ws in
       let cur = List.filter (fun u -> not (List.mem u removed)) cur in
       Workspace.set_folders ws (cur @ added)

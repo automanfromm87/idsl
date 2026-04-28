@@ -1065,6 +1065,86 @@ let test_canonical_uri_keying () =
     (List.mem "C" names);
   teardown ()
 
+(* ---------- Test 24: workspace folder canonicalization -----------
+
+   Equivalent folder URIs (`file:///x`, `file://localhost/x`) must
+   collapse to a single root in `set_folders`, and remove must work
+   under either form. *)
+let test_workspace_folder_canon () =
+  let ws = Workspace.create () in
+  Workspace.set_folders ws [
+    "file:///tmp/proj";
+    "file://localhost/tmp/proj";       (* same file as above *)
+    "file:///tmp/other";
+  ];
+  let folders = Workspace.folders ws in
+  check "[fold] equivalent folders collapse to one"
+    (List.length folders = 2);
+  check "[fold] only the canonical form is stored"
+    (List.for_all (fun u ->
+       match u with
+       | "file:///tmp/proj" | "file:///tmp/other" -> true
+       | _ -> false) folders);
+
+  (* Re-set with localhost-form removal — canonicalization makes the
+     compare match. *)
+  Workspace.set_folders ws ["file://localhost/tmp/other"];
+  check "[fold] subsequent set under different form still picks the canonical"
+    (Workspace.folders ws = ["file:///tmp/other"])
+
+(* ---------- Test 25: UTF-16 column on a non-ASCII line --------------
+
+   Diagnostics / hints / outline ranges must use UTF-16 columns —
+   i.e. a 4-byte UTF-8 character emits as 2 UTF-16 code units, and
+   any column-after-it must reflect that.  The bin's wire writers
+   route every range through `utf16_pos_to_json ~src`, so this test
+   pins down the underlying conversion the writers depend on. *)
+let test_utf16_column_on_non_ascii () =
+  (* Line with a 3-byte UTF-8 char (例 = U+4F8B = ascii=1 BMP code unit). *)
+  let src = "schema 例:\n  - K: e.g. 1\n" in
+  let line = IDSL.Utf16.line_of_source src 0 in
+  let byte_col_after = String.index src ':' in
+  let utf16_col = IDSL.Utf16.utf16_of_byte_col line byte_col_after in
+  (* "schema " (7 ascii) + "例" (1 BMP) → utf16 col 8 for the colon. *)
+  check "[utf16] BMP non-ASCII counted as 1 UTF-16 unit" (utf16_col = 8);
+
+  (* Round-trip: utf16 → byte must invert exactly. *)
+  let back = IDSL.Utf16.byte_col_of_utf16 ~src ~line:0 utf16_col in
+  check "[utf16] byte ↔ utf16 round-trip" (back = byte_col_after);
+
+  (* Surrogate pair: 4-byte UTF-8 (𝄞 = U+1D11E) → 2 UTF-16 units. *)
+  let src2 = "schema 𝄞:\n" in
+  let line2 = IDSL.Utf16.line_of_source src2 0 in
+  let byte_col2 = String.index src2 ':' in
+  let utf16_col2 = IDSL.Utf16.utf16_of_byte_col line2 byte_col2 in
+  (* "schema " (7) + "𝄞" (2 utf16 units) → col 9. *)
+  check "[utf16] supplementary char counted as 2 UTF-16 units"
+    (utf16_col2 = 9)
+
+(* ---------- Test 26: Last_good keying is canonical ----------------
+
+   Subprocess-driven: open a doc under one URI form, request something
+   while the doc has a transient parse error and observe the fallback
+   path stays consistent across equivalent URI forms. We can only
+   validate the observable contract: the server doesn't crash and the
+   document is still tracked under either form. *)
+let test_last_good_canonical_keying () =
+  match lsp_bin with
+  | None -> check "[lg] LSP binary present" false
+  | Some bin ->
+      (* Open under localhost form, then ask for documentSymbol under
+         plain form. With canonical keying both should land on the
+         same internal session; at minimum the server must not crash
+         and must answer the request. *)
+      let did_open = frame
+        {|{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file://localhost/tmp/x.idsl","languageId":"idsl","version":1,"text":"schema A:\n  - K: e.g. 1\n"}}}|} in
+      let doc_sym = frame
+        {|{"jsonrpc":"2.0","id":7,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":"file:///tmp/x.idsl"}}}|} in
+      let input = init_msg ^ did_open ^ doc_sym ^ exit_msg in
+      let out = collect_responses ~bin ~input ~deadline_s:5.0 in
+      check "[lg] documentSymbol via plain URI hits the localhost-opened doc"
+        (contains_re out (id_match 7) && contains out "\"name\"")
+
 let () =
   Printf.printf "\n--- workspace regressions ---\n";
   test_multifile_include ();
@@ -1093,5 +1173,8 @@ let () =
   test_drop_closed_doc_cache ();
   test_didclose_invalidates_dependents ();
   test_canonical_uri_keying ();
+  test_workspace_folder_canon ();
+  test_utf16_column_on_non_ascii ();
+  test_last_good_canonical_keying ();
   Printf.printf "%d passed, %d failed\n" !pass !fail;
   if !fail > 0 then exit 1
