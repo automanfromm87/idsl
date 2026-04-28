@@ -600,7 +600,6 @@ let token_type_of_kind = function
   | Cst.Int _ | Cst.Flt _ | Cst.Money _ | Cst.Date _ -> Some num_type
   | Cst.Op _                                      -> Some op_type
   | Cst.Comment _                                 -> Some comment_type
-  | Cst.EgIe _                                    -> Some kw_type
   | Cst.Ident _ | Cst.Punct _ | Cst.Newline
   | Cst.Whitespace | Cst.Eof                      -> None
 
@@ -1494,22 +1493,31 @@ let complete_call_arg (tp : Typed.tprogram) call arg_ix =
    moves the cursor through them on Tab. *)
 let snippet_completions = [
   ("schema",
-   "schema ${1:Name}:\n  - ${2:Field}: e.g. ${3:value}$0",
+   "schema ${1:Name}:\n  - ${2:Field}: ${3:Type} default ${4:value}$0",
    "Block: schema with one field");
+  ("predicate",
+   "predicate ${1:name} on { ${2:Field}: ${3:Type} }:\n  ${4:expr}$0",
+   "Block: predicate (named pure-Bool, structurally typed)");
   ("rule",
    "rule ${1:name} on ${2:Schema}:\n  when:\n    ${3:predicate}\n  then:\n    ${4:action}$0",
    "Block: rule with when/then");
   ("test",
    "test \"${1:name}\":\n  given ${2:Schema}:\n    ${3:field} = ${4:value}\n  expect:\n    ${5:action}$0",
    "Block: test with given/expect");
+  ("test-table",
+   "test \"${1:name}\" on ${2:Schema}:\n  cases:\n    ${3:field} = ${4:value} -> ${5:action}$0",
+   "Block: table-driven test (cases with arrows)");
   ("instance",
    "instance ${1:Schema} ${2:Name}:\n  ${3:field} = ${4:value}$0",
    "Block: instance assignment");
+  ("domain",
+   "domain ${1:name}:\n  ${2:body}$0",
+   "Block: domain (scoped namespace)");
   ("@action",
    "@action ${1:name}(${2:param}: ${3:Type})$0",
    "Block: @action declaration");
   ("@version",
-   "@version(\"${1:0.0.3}\")$0",
+   "@version(\"${1:0.0.4}\")$0",
    "Metadata: source language version");
   ("@status",
    "@status(\"${1:Active}\")$0",
@@ -1660,7 +1668,8 @@ let references_at ?refs (idx : Semantic_index.t) (cursor : lsp_pos)
           ref_sites in
       Some ((s.decl_pos, decl_length s) :: ref_pairs)
 
-(* Round-7 protocol aliases. *)
+(* `declaration` and `implementation` collapse to `definition` in a
+   language without forward decls or interface/impl distinction. *)
 let declaration_at = def_at
 let implementation_at = def_at
 

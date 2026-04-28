@@ -425,8 +425,7 @@ and check_object_fits env s kvs =
    guarantees is present whenever no annotation was supplied).  The
    sample may reference cross-domain instances or schemas, so the env
    it sees needs the workspace-wide domains / instances tables. *)
-let infer_field_type ?domain ?(instances = Hashtbl.create 0)
-    ?(domains = Hashtbl.create 0)
+let infer_field_type ?domain ~instances ~domains
     schemas (decl : field_decl) : Types.ty =
   let env =
     let base = make_env ~domains schemas (Hashtbl.create 0) instances in
@@ -699,8 +698,14 @@ let check_unique_enum_tags errors schema_pos tschemas =
 
 (* Versions of the DSL surface this build accepts.
    Bump when a syntax/semantics change is breaking; older `.idsl` files
-   declaring an unsupported version will be rejected. *)
-let supported_versions = ["0.0.1"; "0.0.2"; "0.0.3"]
+   declaring an unsupported version will be rejected.
+
+   0.0.1–0.0.3 used `e.g.` / `i.e.` keywords and pipe-separated enums.
+   0.0.4 introduced `default` / `=` for fields, `predicate`, table
+   tests, three-valued logic, and cross-domain qualified refs. The
+   surfaces are syntactically incompatible, so old version strings are
+   no longer accepted. *)
+let supported_versions = ["0.0.4"]
 
 let check_metadata errors program =
   List.iter (function

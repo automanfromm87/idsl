@@ -26,7 +26,7 @@ let opt = function Some x -> [x] | None -> []
 %token <Cst.tok> ACTION INSTANCE ON PRIORITY INCLUDE DOMAIN
 %token <Cst.tok> PREDICATE SELF CASES ARROW
 %token <Cst.tok> COLON COMMA LPAREN RPAREN LBRACKET RBRACKET LBRACE RBRACE
-%token <Cst.tok> DOT AT PIPE
+%token <Cst.tok> DOT AT
 %token <Cst.tok> EQEQ NEQ LEQ GEQ LT GT EQ UNDERSCORE
 %token <Cst.tok> PLUS MINUS STAR SLASH
 %token <Cst.tok> NEWLINE EOF

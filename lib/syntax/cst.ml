@@ -16,7 +16,6 @@ type kind =
   | Money    of string
   | Date     of string
   | Bool     of bool
-  | EgIe     of string         (* "e.g." or "i.e." *)
   | Newline
   | Whitespace
   | Comment  of string
@@ -72,10 +71,6 @@ let active_state () : state =
   | None ->
       failwith "Cst: no active parse state — call sites must run \
                 inside Cst.with_state"
-
-(* Per-parse state replaces the old explicit reset; kept as a no-op so
-   the lexer's call site doesn't need to change. *)
-let reset () = ()
 
 let add_trivia kind lexbuf =
   let s = active_state () in
@@ -194,7 +189,6 @@ let pp_token_kind = function
   | Money _     -> "Money"
   | Date _      -> "Date"
   | Bool _      -> "Bool"
-  | EgIe s      -> Printf.sprintf "EgIe %S" s
   | Newline     -> "Newline"
   | Whitespace  -> "Whitespace"
   | Comment _   -> "Comment"

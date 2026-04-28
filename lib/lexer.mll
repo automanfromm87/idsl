@@ -42,7 +42,7 @@ let is_continuation = function
   | IF _ | THEN _ | ELSE _ | NOT _ | IS _ | IN _ | OF _ | WHERE _ | FOR _
   | DEFAULT _ | LBRACKET _ | COLON _ | LBRACE _ | EQ _
   | TEST _ | GIVEN _ | EXPECT _
-  | ACTION _ | PIPE _ | INSTANCE _ | ON _ | PRIORITY _ | INCLUDE _
+  | ACTION _ | INSTANCE _ | ON _ | PRIORITY _ | INCLUDE _
   | DOMAIN _ | PREDICATE _ | CASES _ | ARROW _
     -> true
   | _ -> false
@@ -60,8 +60,7 @@ let add_trivia kind lexbuf =
 
 (* Install a fresh state at the start of each parse_lexbuf. *)
 let reset () =
-  current := make_state ();
-  Cst.reset ()
+  current := make_state ()
 }
 
 let digit    = ['0'-'9']
@@ -167,7 +166,6 @@ rule token = parse
   | '}'                         { (!current).paren_depth <- (!current).paren_depth - 1; emit_log lexbuf (Punct "}") (fun ct -> RBRACE ct) }
   | '.'                         { emit_log lexbuf (Punct ".") (fun ct -> DOT ct) }
   | '@'                         { emit_log lexbuf (Punct "@") (fun ct -> AT ct) }
-  | '|'                         { emit_log lexbuf (Punct "|") (fun ct -> PIPE ct) }
   | eof {
       let st = !current in
       if st.at_eof then emit_log lexbuf Eof (fun ct -> EOF ct)

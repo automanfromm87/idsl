@@ -660,7 +660,7 @@ let handle_hover id params =
             ];
           ])
 
-(* ---------- Round-1 navigation handlers ---------- *)
+(* ---------- navigation: hover / definition / references ---------- *)
 
 let rec doc_symbol_to_json ~src (s : Lsp_query.doc_symbol) : Json.t =
   let base = [
@@ -817,7 +817,7 @@ let handle_selection_range id params =
     let arr = List.map chain_of positions in
     result id (JArr arr)
 
-(* ---------- Round-2 information handlers ---------- *)
+(* ---------- information: hover / signatureHelp / inlay / lens ---------- *)
 
 let sig_param_to_json (p : Lsp_query.sig_param) : Json.t =
   JObj [
@@ -929,7 +929,7 @@ let handle_semantic_tokens id params =
         let arr = List.map (fun n -> Json.JNum (float_of_int n)) data in
         result id (JObj [ "data", JArr arr ])
 
-(* ---------- Round-3 refactor handlers ---------- *)
+(* ---------- refactor: rename / codeAction ---------- *)
 
 (* Group `(uri, JSON-encoded TextEdit)` pairs into the LSP WorkspaceEdit
    `changes` shape: `{ uri -> TextEdit[] }`. Used by both rename and
@@ -1074,7 +1074,7 @@ let handle_code_action id params =
             ] :: !actions) qfs) diags;
     result id (JArr (List.rev !actions))
 
-(* ---------- Round-4 formatting handlers ---------- *)
+(* ---------- formatting ---------- *)
 
 let line_count_of (s : string) : int =
   let n = ref 1 in
@@ -1152,7 +1152,7 @@ let handle_on_type_formatting id params =
       let arr = List.map text_edit_to_json edits in
       result id (JArr arr)
 
-(* ---------- Round-7 advanced handlers ---------- *)
+(* ---------- advanced: callHierarchy / typeHierarchy / pull diags ---------- *)
 
 (* `uri` is the *fallback* — used when the position carries no source
    filename (in-memory buffer not stamped via `Lexing.set_filename`).
@@ -1433,7 +1433,7 @@ let handle_will_rename_files id params =
   let pairs = List.map (fun (uri, e) -> uri, text_edit_to_json e) all_edits in
   result id (workspace_edit_changes pairs)
 
-(* ---------- Round-5 workspace handlers ----------
+(* ---------- workspace handlers ----------
 
    - workspace/didChangeWatchedFiles  invalidate caches for files that
      changed on disk while the editor was idle (e.g., rebase, save in

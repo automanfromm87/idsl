@@ -601,13 +601,6 @@ let lower_test_one (n : node) : test_def list =
          tdomain = None }]
   | _ -> err "test shape"
 
-(* Backwards-compat single-result wrapper for the few internal callers
-   that still want one (currently none). *)
-let lower_test (n : node) : test_def =
-  match lower_test_one n with
-  | [t] -> t
-  | _ -> err "use lower_test_one for table-driven tests"
-
 (* ---------- top-level ---------- *)
 
 (* Pull the IDENT child out of a `domain X:` block. *)
@@ -646,9 +639,9 @@ let lower_program (root : node) : Ast.program =
          | NPredicate -> [attach_domain ~domain (TPredicate (lower_predicate  n))]
          | NInclude   -> [TInclude   (lower_include    n)]
          | NDomain   ->
-             (* Phase-1 limit: nested domain blocks flatten into the
-                outermost one (the bare name wins).  We don't yet
-                support hierarchical paths like `foo.bar.X`. *)
+             (* Nested `domain` blocks flatten into the innermost
+                non-anonymous name.  Hierarchical names like
+                `foo.bar.X` are not supported. *)
              let inner_domain = match domain_name_of n with
                | Some _ as d -> d
                | None -> domain in

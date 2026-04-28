@@ -53,7 +53,7 @@ let assert_tc_err label expected_substr src =
 
 let () =
   assert_ok "metadata"
-    {|@version("0.0.1")
+    {|@version("0.0.4")
 @status("Active")
 |};
 
